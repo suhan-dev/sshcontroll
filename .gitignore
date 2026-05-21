@@ -1,0 +1,50 @@
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+
+# Local app builds and exported bundles
+*.app/
+*.dSYM/
+dist/
+*.pkg
+*.zip
+*.sha256
+SHA256SUMS.txt
+
+# Local runtime data
+settings.json
+sessions.json
+Prompt Attachments/
+Previews/
+WORKLOG/
+*_HANDOFF.md
+*_PRIVATE.md
+*.log
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Flutter/mobile generated files
+Mobile/.dart_tool/
+Mobile/.tools/
+Mobile/build/
+Mobile/build_outputs/
+Mobile/ios/Pods/
+Mobile/ios/Flutter/ephemeral/
+Mobile/.flutter-plugins
+Mobile/.flutter-plugins-dependencies
+Mobile/*.iml
+
+# Secrets
+*.pem
+*.key
+*.p8
+*.mobileprovision
+id_rsa
+id_ed25519
+known_hosts
+authorized_keys
