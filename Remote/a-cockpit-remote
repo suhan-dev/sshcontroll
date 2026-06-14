@@ -243,7 +243,6 @@ run_screenshot() {
 
 run_automation() {
   log_run system-events osascript -e 'tell application "System Events" to get name of first process'
-  log_run finder-automation osascript -e 'tell application "Finder" to get name of startup disk'
 }
 
 run_mfc_dump() {
@@ -501,7 +500,7 @@ run_file() {
   } >> "$log_path" 2>&1
 }
 
-open_folder_after=1
+open_folder_after=0
 case "${1:-prep}" in
   screenshot)
     run_screenshot
@@ -603,6 +602,8 @@ session_start_dir() {
   local dir
   dir="${SESSION_DIR/#\~/$HOME}"
   if [[ -d "$dir" ]]; then
+    print -r -- "$dir"
+  elif mkdir -p -- "$dir" 2>/dev/null; then
     print -r -- "$dir"
   else
     print -r -- "$HOME"
@@ -874,6 +875,10 @@ PY
 open_permission_host_app() {
   local uid rc open_error
   local -a open_args
+  if [[ "${A_COCKPIT_ALLOW_PERMISSION_GUI:-}" != "1" ]]; then
+    printf '%s\n' 'Permission Host launch blocked: set A_COCKPIT_ALLOW_PERMISSION_GUI=1 only for an intentional foreground GUI action.' >&2
+    return 66
+  fi
   open_args=()
   if [[ "${1:-}" == "--new" ]]; then
     open_args=(-n)
@@ -905,6 +910,16 @@ open_permission_host_app() {
   fi
   rm -f "$open_error"
   return 0
+}
+
+require_permission_gui_intent() {
+  local command_name="${1:-permission GUI command}"
+  if [[ "${A_COCKPIT_ALLOW_PERMISSION_GUI:-}" == "1" ]]; then
+    return 0
+  fi
+  printf '%s\n' "$command_name blocked: GUI permission actions require A_COCKPIT_ALLOW_PERMISSION_GUI=1." >&2
+  printf '%s\n' 'Use permission-status or permission-status-quiet for background/status polling.' >&2
+  return 66
 }
 
 fan_apply_menu_bar() {
@@ -1290,6 +1305,7 @@ codex_cli_permission_bridge_path() {
 
 codex_cli_permission_status() {
   local bridge out rc
+  require_permission_gui_intent "codex-cli-permission-status" || return $?
   printf '%s\n' 'Codex CLI Permission Host'
   if [[ -d "$CODEX_CLI_PERMISSION_HOST_APP" ]]; then
     printf 'Codex CLI Permission Host.app: installed\n'
@@ -1324,6 +1340,7 @@ codex_cli_permission_status() {
 
 codex_cli_permission_prep() {
   local bridge
+  require_permission_gui_intent "codex-cli-permission-prep" || return $?
   bridge="$(codex_cli_permission_bridge_path 2>/dev/null || true)"
   open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture" >/dev/null 2>&1 || true
   open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" >/dev/null 2>&1 || true
@@ -1338,7 +1355,18 @@ codex_cli_permission_prep() {
 }
 
 permission_status() {
+  local rc
+  unset A_COCKPIT_ALLOW_PERMISSION_GUI
+  permission_status_quiet
+  rc="$?"
+  printf '\n%s\n' 'Live GUI probes are disabled for permission-status.'
+  printf '%s\n' 'Use permission-status-live, permission-screenshot, or permission-prep only when you intentionally want A-side GUI permission prompts.'
+  return "$rc"
+}
+
+permission_status_live() {
   local tk_python wrapper_target critical_fail live_screen live_script live_log i
+  require_permission_gui_intent "permission-status-live" || return $?
   critical_fail=0
   tk_python="$(find_tk_python 2>/dev/null || true)"
 
@@ -1437,7 +1465,6 @@ run_probe() {
 echo "probe_start=\$(date '+%Y-%m-%d %H:%M:%S')"
 run_probe screen 6 screencapture -x "$live_screen"
 run_probe system_events 4 osascript -e 'tell application "System Events" to count processes'
-run_probe finder 4 osascript -e 'tell application "Finder" to get name of startup disk'
 if command -v xcrun >/dev/null 2>&1; then
   run_probe simctl 8 xcrun simctl list devices available
 else
@@ -1469,11 +1496,6 @@ EOF
   else
     printf 'Accessibility/System Events via Permission Host: blocked\n'
     critical_fail=1
-  fi
-  if grep -q '^finder=0$' "$live_log" 2>/dev/null; then
-    printf 'Finder automation via Permission Host: OK\n'
-  else
-    printf 'Finder automation via Permission Host: not currently available\n'
   fi
   if grep -q '^simctl=0$' "$live_log" 2>/dev/null; then
     printf 'CoreSimulator/simctl via Permission Host: OK\n'
@@ -1519,8 +1541,36 @@ EOF
   return "$critical_fail"
 }
 
+permission_status_quiet() {
+  local tk_python critical_fail
+  critical_fail=0
+  tk_python="$(find_tk_python 2>/dev/null || true)"
+
+  printf 'A Permission Quiet Status  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  if [[ -d "$PERMISSION_HOST_APP" ]]; then
+    printf 'A-Cockpit Permission Host.app: installed\n'
+  else
+    printf 'A-Cockpit Permission Host.app: not installed yet\n'
+    critical_fail=1
+  fi
+  if [[ -n "$tk_python" ]]; then
+    printf 'Tk-capable Python: available\n'
+  else
+    printf 'Tk-capable Python: not found\n'
+    critical_fail=1
+  fi
+  if [[ -x "$TK_WRAPPER" ]]; then
+    printf 'Tk wrapper: installed\n'
+  else
+    printf 'Tk wrapper: not installed yet\n'
+    critical_fail=1
+  fi
+  return "$critical_fail"
+}
+
 permission_prep() {
   local tk_python
+  require_permission_gui_intent "permission-prep" || return $?
   install_permission_host_app
   tk_python="$(install_tk_wrapper 2>/dev/null || true)"
   mkdir -p "$PERMISSION_DIR"
@@ -1567,6 +1617,7 @@ EOF
 
 permission_screenshot() {
   local screenshot_path
+  require_permission_gui_intent "permission-screenshot" || return $?
   install_permission_host_app
   mkdir -p "$PERMISSION_DIR" 2>/dev/null || true
   screenshot_path="$PERMISSION_DIR/screenshot-test.png"
@@ -1619,6 +1670,7 @@ expand_remote_path() {
 
 permission_open_target() {
   local pane target label url expanded
+  require_permission_gui_intent "permission-open-target" || return $?
   IFS= read -r pane || pane="fullDiskAccess"
   IFS= read -r target || target=""
   IFS= read -r label || label=""
@@ -1630,20 +1682,16 @@ permission_open_target() {
   fi
 
   open "$url" >/dev/null 2>&1 || true
-  if [[ -e "$expanded" ]]; then
-    open -R "$expanded" >/dev/null 2>&1 || true
-    if [[ -d "$expanded" && "$expanded" == *.app ]]; then
-      open -a "$expanded" >/dev/null 2>&1 || true
-    fi
-  else
+  if [[ ! -e "$expanded" ]]; then
     printf 'Permission target not found: %s\n' "$expanded" >&2
   fi
 
   cat <<EOF
-A permission target opened.
+A permission pane opened.
 name: ${label:-$target}
 pane: $pane
 path: $expanded
+finder_reveal: disabled
 
 On A, add or enable this target in the opened Privacy & Security pane.
 macOS still requires the final approval click from the user.
@@ -1763,6 +1811,7 @@ apple_signing_test() {
 
 codex_permission_prep() {
   local app bin
+  require_permission_gui_intent "codex-permission-prep" || return $?
   app="$(codex_app_path 2>/dev/null || true)"
   bin="$(codex_app_bin 2>/dev/null || true)"
   open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" >/dev/null 2>&1 || true
@@ -2256,26 +2305,7 @@ network_speed() {
 }
 
 ensure_tailscale() {
-  if command -v tailscale >/dev/null 2>&1; then
-    if tailscale status --self >/dev/null 2>&1; then
-      printf 'Tailscale ready on A.\n'
-      return 0
-    fi
-  elif [[ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]]; then
-    if /Applications/Tailscale.app/Contents/MacOS/Tailscale status --self >/dev/null 2>&1; then
-      printf 'Tailscale ready on A.\n'
-      return 0
-    fi
-  fi
-
-  if [[ -d "/Applications/Tailscale.app" ]]; then
-    open -ga Tailscale >/dev/null 2>&1 || true
-    sleep 1
-    printf 'Tailscale launch requested on A.\n'
-  else
-    printf 'Tailscale app not found on A.\n' >&2
-    return 66
-  fi
+  printf 'Tailscale support is disabled; using direct SSH only.\n'
 }
 
 monitor_once() {
@@ -2341,7 +2371,7 @@ wait_for_codex_input_ready() {
       sleep 0.6
       continue
     fi
-    if [[ "$lower" == *"working"* || "$lower" == *"esc to interrupt"* || "$lower" == *"tab to queue message"* ]]; then
+    if codex_queue_pane_is_busy "$bottom_text"; then
       return 0
     fi
     if [[ "$bottom_text" == *"›"* || "$lower" == *"model:"* || "$lower" == *"directory:"* ]]; then
@@ -2381,7 +2411,7 @@ paste_stdin_and_enter() {
       echo "Codex is showing an interactive choice. Pick an option in the live Codex terminal first, then send again." >&2
       exit 65
     fi
-    if [[ "$pane_text" == *"Working"* || "$pane_text" == *"esc to interrupt"* || "$pane_text" == *"tab to queue message"* ]]; then
+    if codex_queue_pane_is_busy "$pane_text"; then
       busy=1
     fi
   fi
@@ -2392,7 +2422,13 @@ paste_stdin_and_enter() {
     exit 65
   fi
 
-  if [[ "$mode" == "codex" && "$busy" != "1" && "$submit_mode" != "steer" ]]; then
+  if [[ "$mode" == "codex" && "$submit_mode" == "steer" && "$busy" != "1" ]]; then
+    rm -f "$tmp_file"
+    echo "Codex is not currently working; use Send for a new prompt instead of Steer." >&2
+    exit 65
+  fi
+
+  if [[ "$mode" == "codex" && "$busy" != "1" ]]; then
     if ! wait_for_codex_input_ready "$target"; then
       rm -f "$tmp_file"
       echo "Codex input was not ready for session $target. The prompt was not pasted." >&2
@@ -2400,7 +2436,7 @@ paste_stdin_and_enter() {
     fi
   fi
 
-  if { [[ "$mode" == "codex" && "$busy" != "1" && "$submit_mode" != "steer" ]]; } || [[ "$mode" == "claude" ]]; then
+  if { [[ "$mode" == "codex" && "$busy" != "1" ]]; } || [[ "$mode" == "claude" ]]; then
     tmux send-keys -t "$target" Escape C-u 2>/dev/null || true
     sleep 0.04
   fi
@@ -2600,6 +2636,16 @@ codex_queue_pane_is_interactive() {
     || "$pane_text" == *"Switch to gpt-"* ]]
 }
 
+codex_queue_pane_needs_recovery() {
+  local pane_text="$1"
+  local lower
+  lower="$(print -r -- "$pane_text" | tr '[:upper:]' '[:lower:]')"
+  [[ "$lower" == *"stream disconnected before completion"* \
+    || "$lower" == *"failed to send websocket request"* \
+    || "$lower" == *"broken pipe"* \
+    || "$lower" == *"reconnecting..."* ]]
+}
+
 codex_queue_pane_is_busy() {
   local pane_text="$1"
   local lower
@@ -2607,7 +2653,9 @@ codex_queue_pane_is_busy() {
   [[ "$lower" == *"working"* \
     || "$lower" == *"thinking"* \
     || "$lower" == *"esc to interrupt"* \
-    || "$lower" == *"tab to queue message"* ]]
+    || "$lower" == *"tab to queue message"* \
+    || "$lower" == *"작업 중"* \
+    || "$lower" == *"진행 중"* ]]
 }
 
 codex_queue_wait_for_send_ack() {
@@ -2616,6 +2664,9 @@ codex_queue_wait_for_send_ack() {
   local pane_text
   while (( waited < 48 )); do
     pane_text="$(codex_queue_pane_text "$target")"
+    if codex_queue_pane_needs_recovery "$pane_text"; then
+      return 2
+    fi
     if codex_queue_pane_is_busy "$pane_text"; then
       return 0
     fi
@@ -2741,7 +2792,7 @@ codex_queue_enqueue() {
   local kind="${1:-send}"
   local model="${2:-}"
   local effort="${3:-}"
-  local root tmp_dir job_id job_dir worker prompt_bytes
+  local root tmp_dir job_id job_dir worker prompt_bytes force_new exclude_history_ids job_history_id
   case "$kind" in
     send|steer) ;;
     *)
@@ -2768,6 +2819,12 @@ codex_queue_enqueue() {
   fi
 
   root="$(codex_queue_root)"
+  force_new="${A_COCKPIT_CODEX_FORCE_NEW:-0}"
+  exclude_history_ids="${A_COCKPIT_CODEX_EXCLUDE_HISTORY_IDS:-}"
+  job_history_id="$CODEX_HISTORY_ID"
+  if [[ "$force_new" == "1" || "$force_new" == "true" || "$force_new" == "yes" ]]; then
+    job_history_id=""
+  fi
   codex_queue_prepare_dirs "$root"
   job_id="$(date '+%Y%m%d%H%M%S')-$$-$RANDOM"
   tmp_dir="$root/.tmp-$job_id"
@@ -2779,9 +2836,15 @@ codex_queue_enqueue() {
   if [[ "$kind" == "steer" ]]; then
     : > "$tmp_dir/is-steer"
   fi
+  if [[ "$force_new" == "1" || "$force_new" == "true" || "$force_new" == "yes" ]]; then
+    : > "$tmp_dir/force-new"
+  fi
+  if [[ -n "$exclude_history_ids" ]]; then
+    print -r -- "$exclude_history_ids" > "$tmp_dir/exclude_history_ids"
+  fi
   print -r -- "$model" > "$tmp_dir/model"
   print -r -- "$effort" > "$tmp_dir/effort"
-  print -r -- "$CODEX_HISTORY_ID" > "$tmp_dir/history_id"
+  print -r -- "$job_history_id" > "$tmp_dir/history_id"
   print -r -- "$(session_start_dir)" > "$tmp_dir/dir"
   print -r -- "$CODEX_SESSION" > "$tmp_dir/codex_session"
   print -r -- "$(date '+%Y-%m-%dT%H:%M:%S%z')" > "$tmp_dir/created_at"
@@ -2789,7 +2852,7 @@ codex_queue_enqueue() {
   print -r -- "$prompt_bytes" > "$tmp_dir/prompt_bytes"
   mv "$tmp_dir" "$job_dir"
   worker="$(codex_queue_worker_session)"
-  codex_queue_log "$root" "enqueued id=$job_id kind=$kind bytes=$prompt_bytes history=${CODEX_HISTORY_ID:-none} dir=$(session_start_dir)"
+  codex_queue_log "$root" "enqueued id=$job_id kind=$kind bytes=$prompt_bytes history=${job_history_id:-none} force_new=${force_new:-0} excludes=$(print -r -- "$exclude_history_ids" | tr ',[:space:]' ' ' | wc -w | tr -d '[:space:]') dir=$(session_start_dir)"
   codex_queue_worker_start
   printf 'a_queue_status: queued_on_a\n'
   printf 'a_queue_id: %s\n' "$job_id"
@@ -2873,6 +2936,17 @@ for index, job in enumerate(jobs):
     client_id = str(job.get("clientID") or f"job-{index + 1}")
     directory = str(job.get("directory") or default_dir)
     history_id = str(job.get("historyID") or default_history_id)
+    force_new = bool(job.get("forceNew"))
+    exclude_history_ids = job.get("excludeHistoryIDs") or []
+    if isinstance(exclude_history_ids, str):
+        exclude_history_ids = [part.strip() for part in exclude_history_ids.replace("\n", ",").split(",")]
+    elif isinstance(exclude_history_ids, list):
+        exclude_history_ids = [str(part).strip() for part in exclude_history_ids]
+    else:
+        exclude_history_ids = []
+    exclude_history_ids = [part for part in exclude_history_ids if part]
+    if force_new:
+        history_id = ""
     order = str(job.get("order") or f"{int(time.time() * 1000):013d}-{index:04d}")
     job_id = time.strftime("%Y%m%d%H%M%S") + f"-{os.getpid()}-{random.randint(10000, 99999)}-{index + 1:02d}"
     tmp_dir = root / f".tmp-{job_id}"
@@ -2882,6 +2956,10 @@ for index, job in enumerate(jobs):
     (tmp_dir / "kind").write_text(kind + "\n")
     if kind == "steer":
         (tmp_dir / "is-steer").write_text("")
+    if force_new:
+        (tmp_dir / "force-new").write_text("")
+    if exclude_history_ids:
+        (tmp_dir / "exclude_history_ids").write_text(",".join(exclude_history_ids) + "\n")
     (tmp_dir / "model").write_text(model + "\n")
     (tmp_dir / "effort").write_text(effort + "\n")
     (tmp_dir / "history_id").write_text(history_id + "\n")
@@ -2891,9 +2969,9 @@ for index, job in enumerate(jobs):
     (tmp_dir / "order").write_text(order + "\n")
     (tmp_dir / "prompt_bytes").write_text(str(len(prompt.encode())) + "\n")
     shutil.move(str(tmp_dir), str(job_dir))
-    created.append((client_id, job_id, kind, len(prompt.encode()), directory, history_id))
+    created.append((client_id, job_id, kind, len(prompt.encode()), directory, history_id, force_new))
 
-for client_id, job_id, kind, prompt_bytes, directory, history_id in created:
+for client_id, job_id, kind, prompt_bytes, directory, history_id, force_new in created:
     print(f"a_queue_id:{client_id}:{job_id}")
 print(f"a_queue_status: queued_on_a")
 print(f"a_queue_batch_count: {len(created)}")
@@ -3045,7 +3123,7 @@ codex_queue_fail_job() {
 }
 
 codex_queue_worker() {
-  local root idle_ticks job job_id job_kind model effort history_id dir pane_text busy interactive result acq_job_is_steer acq_sent_kind prompt_hint latest_history
+  local root idle_ticks job job_id job_kind model effort history_id dir pane_text busy interactive result acq_job_is_steer acq_sent_kind prompt_hint latest_history force_new exclude_history_ids started_with_initial_prompt
   local -a queued_jobs
   root="$(codex_queue_root)"
   codex_queue_prepare_dirs "$root"
@@ -3080,9 +3158,16 @@ codex_queue_worker() {
     model="$(codex_queue_read_file "$job/model")"
     effort="$(codex_queue_read_file "$job/effort")"
     history_id="$(codex_queue_read_file "$job/history_id")"
+    force_new=0
+    [[ -f "$job/force-new" ]] && force_new=1
+    exclude_history_ids="$(codex_queue_read_file "$job/exclude_history_ids")"
+    if [[ "$force_new" == "1" ]]; then
+      history_id=""
+      codex_mark_history ""
+    fi
     dir="$(codex_queue_read_file "$job/dir")"
     [[ -n "$dir" ]] || dir="$(session_start_dir)"
-    codex_queue_log "$root" "processing id=$job_id kind=$job_kind is_steer=$acq_job_is_steer history=${history_id:-none} dir=$dir"
+    codex_queue_log "$root" "processing id=$job_id kind=$job_kind is_steer=$acq_job_is_steer history=${history_id:-none} force_new=$force_new excludes=$(print -r -- "$exclude_history_ids" | tr ',[:space:]' ' ' | wc -w | tr -d '[:space:]') dir=$dir"
 
     pane_text=""
     busy=0
@@ -3091,6 +3176,15 @@ codex_queue_worker() {
       pane_text="$(codex_queue_pane_text "$CODEX_SESSION")"
       codex_queue_pane_is_interactive "$pane_text" && interactive=1
       codex_queue_pane_is_busy "$pane_text" && busy=1
+      if codex_queue_pane_needs_recovery "$pane_text"; then
+        codex_queue_log "$root" "recovering_disconnected_codex id=$job_id history=${history_id:-none} dir=$dir"
+        codex_queue_recover_codex_session "$dir" "$history_id" "$model" "$effort" >> "$job/worker.log" 2>&1 || {
+          codex_queue_fail_job "$root" "$job" "codex_recovery_failed"
+          continue
+        }
+        sleep 4
+        continue
+      fi
     fi
     if [[ "$interactive" == "1" ]]; then
       codex_queue_log "$root" "waiting_interactive_choice id=$job_id"
@@ -3112,24 +3206,33 @@ codex_queue_worker() {
       continue
     fi
 
-    if [[ "$acq_job_is_steer" != "1" || "$busy" != "1" ]]; then
-      if ! ( print -r -- "$dir" | ensure_codex_for_prompt "$model" "$effort" "$history_id" ) >> "$job/worker.log" 2>&1; then
+    started_with_initial_prompt=0
+    if [[ "$acq_job_is_steer" != "1" && "$force_new" == "1" ]]; then
+      if ! ( print -r -- "$dir" | restart_codex_in_dir_with_prompt_file "$model" "$effort" "$job/prompt.txt" ) >> "$job/worker.log" 2>&1; then
+        codex_queue_fail_job "$root" "$job" "fresh_codex_start_failed"
+        continue
+      fi
+      started_with_initial_prompt=1
+    elif [[ "$acq_job_is_steer" != "1" || "$busy" != "1" ]]; then
+      if ! ( export A_COCKPIT_CODEX_FORCE_NEW="$force_new"; export A_COCKPIT_CODEX_EXCLUDE_HISTORY_IDS="$exclude_history_ids"; print -r -- "$dir" | ensure_codex_for_prompt "$model" "$effort" "$history_id" ) >> "$job/worker.log" 2>&1; then
         codex_queue_fail_job "$root" "$job" "ensure_codex_failed"
         continue
       fi
     fi
 
-    pane_text="$(codex_queue_pane_text "$CODEX_SESSION")"
-    if codex_queue_pane_is_interactive "$pane_text"; then
-      mv "$job" "$root/queued/$job_id" 2>/dev/null || true
-      codex_queue_log "$root" "requeued_interactive_choice id=$job_id"
-      sleep 5
-      continue
-    fi
-    if [[ "$acq_job_is_steer" != "1" ]] && codex_queue_pane_is_busy "$pane_text"; then
-      mv "$job" "$root/queued/$job_id" 2>/dev/null || true
-      sleep 2
-      continue
+    if [[ "$started_with_initial_prompt" != "1" ]]; then
+      pane_text="$(codex_queue_pane_text "$CODEX_SESSION")"
+      if codex_queue_pane_is_interactive "$pane_text"; then
+        mv "$job" "$root/queued/$job_id" 2>/dev/null || true
+        codex_queue_log "$root" "requeued_interactive_choice id=$job_id"
+        sleep 5
+        continue
+      fi
+      if [[ "$acq_job_is_steer" != "1" ]] && codex_queue_pane_is_busy "$pane_text"; then
+        mv "$job" "$root/queued/$job_id" 2>/dev/null || true
+        sleep 2
+        continue
+      fi
     fi
 
     local send_epoch
@@ -3140,6 +3243,8 @@ codex_queue_worker() {
       else
         result=$?
       fi
+    elif [[ "$started_with_initial_prompt" == "1" ]]; then
+      result=0
     else
       if ( cat "$job/prompt.txt" | paste_stdin_and_enter "$CODEX_SESSION" codex queue ) >> "$job/worker.log" 2>&1; then
         result=0
@@ -3149,11 +3254,38 @@ codex_queue_worker() {
     fi
     if [[ "$result" == "0" ]]; then
       if [[ "$acq_job_is_steer" != "1" ]]; then
-        codex_queue_wait_for_send_ack "$CODEX_SESSION" >> "$job/worker.log" 2>&1 || true
+        local ack_result recover_attempts
+        ack_result=0
+        if [[ "$started_with_initial_prompt" != "1" ]]; then
+          codex_queue_wait_for_send_ack "$CODEX_SESSION" >> "$job/worker.log" 2>&1 || ack_result=$?
+        fi
+        if [[ "$ack_result" == "2" ]]; then
+          recover_attempts="$(cat "$job/recover_attempts" 2>/dev/null || print -r -- 0)"
+          [[ "$recover_attempts" == <-> ]] || recover_attempts=0
+          recover_attempts=$((recover_attempts + 1))
+          print -r -- "$recover_attempts" > "$job/recover_attempts"
+          codex_queue_log "$root" "requeue_after_codex_disconnect id=$job_id attempt=$recover_attempts"
+          if (( recover_attempts <= 2 )); then
+            mv "$job" "$root/queued/$job_id" 2>/dev/null || true
+            codex_queue_recover_codex_session "$dir" "$history_id" "$model" "$effort" >> "$root/queued/$job_id/worker.log" 2>&1 || true
+            sleep 4
+            continue
+          fi
+          codex_queue_fail_job "$root" "$job" "codex_disconnected_before_ack"
+          continue
+        fi
         prompt_hint="$(LC_ALL=C head -c 360 "$job/prompt.txt" 2>/dev/null | tr '\n' ' ' || true)"
-        codex_register_latest_history_for_dir "$dir" "$model" "$effort" "$prompt_hint" "$((send_epoch - 1))" >> "$job/worker.log" 2>&1 || true
-        latest_history="$(codex_current_history_marker)"
-        [[ -n "$latest_history" ]] && print -r -- "$latest_history" > "$job/history_id" 2>/dev/null || true
+        local register_result
+        register_result=0
+        A_COCKPIT_CODEX_EXCLUDE_HISTORY_IDS="$exclude_history_ids" codex_register_latest_history_for_dir "$dir" "$model" "$effort" "$prompt_hint" "$((send_epoch - 1))" >> "$job/worker.log" 2>&1 || register_result=$?
+        if [[ "$register_result" == "0" ]]; then
+          latest_history="$(codex_current_history_marker)"
+          [[ -n "$latest_history" ]] && print -r -- "$latest_history" > "$job/history_id" 2>/dev/null || true
+        else
+          codex_mark_history ""
+          : > "$job/history_id" 2>/dev/null || true
+          print -r -- "codex_history_id_unresolved: new history not visible yet" >> "$job/worker.log" 2>/dev/null || true
+        fi
       fi
       print -r -- "$(date '+%Y-%m-%dT%H:%M:%S%z')" > "$job/sent_at"
       mkdir -p "$root/done"
@@ -3313,6 +3445,37 @@ codex_add_runtime_args_if_needed() {
 codex_queue_start() {
   codex_queue_worker_start
   codex_queue_status
+}
+
+codex_queue_recover_codex_session() {
+  local dir="$1"
+  local history_id="${2:-}"
+  local model="${3:-}"
+  local effort="${4:-}"
+  local -a codex_args
+  [[ -n "$dir" && -d "$dir" ]] || dir="$(session_start_dir)"
+  if [[ -z "$CODEX_BIN" || ! -x "$CODEX_BIN" ]]; then
+    echo "Codex CLI was not found. Expected codex on PATH, Codex.app, or a valid SSHcontroll Codex Path override." >&2
+    return 127
+  fi
+  need_tmux
+  tmux kill-session -t "$CODEX_SESSION" 2>/dev/null || true
+  if [[ -n "$history_id" ]]; then
+    codex_args=("$CODEX_BIN" "resume" "$history_id" "-C" "$dir")
+  else
+    codex_args=("$CODEX_BIN")
+  fi
+  if [[ -n "$model" ]]; then
+    codex_args+=("-m" "$model")
+  fi
+  if [[ -n "$effort" ]]; then
+    codex_args+=("-c" "model_reasoning_effort=\"$effort\"")
+  fi
+  codex_add_runtime_args_if_needed
+  tmux new-session -d -s "$CODEX_SESSION" -c "$dir" "${codex_args[@]}"
+  codex_mark_history "$history_id"
+  codex_mark_runtime "$(codex_runtime_mode_label)"
+  echo "$CODEX_SESSION recovered in $dir${history_id:+ with Codex history $history_id}"
 }
 
 codex_history_marker_file() {
@@ -3569,7 +3732,7 @@ codex_command() {
     echo "Codex is already showing an interactive choice. Use the arrow controls or Esc first." >&2
     exit 65
   fi
-  if [[ "$pane_text" == *"Working"* || "$pane_text" == *"esc to interrupt"* || "$pane_text" == *"tab to queue message"* ]]; then
+  if codex_queue_pane_is_busy "$pane_text"; then
     echo "Codex is working. Slash commands cannot be queued; wait for the current turn, then try again." >&2
     exit 65
   fi
@@ -3659,8 +3822,10 @@ restart_codex_in_dir() {
     exit 127
   fi
   if [[ ! -d "$dir" ]]; then
-    echo "not a directory: $dir" >&2
-    exit 66
+    if ! mkdir -p -- "$dir" 2>/dev/null; then
+      echo "not a directory: $dir" >&2
+      exit 66
+    fi
   fi
   need_tmux
   if tmux has-session -t "$CODEX_SESSION" 2>/dev/null; then
@@ -3705,6 +3870,63 @@ restart_codex_in_dir() {
   fi
 }
 
+restart_codex_in_dir_with_prompt_file() {
+  local model effort prompt_file dir prompt_text
+  model="${1:-}"
+  effort="${2:-}"
+  prompt_file="${3:-}"
+  dir="$(read_path_arg)"
+  if [[ -z "$CODEX_BIN" || ! -x "$CODEX_BIN" ]]; then
+    echo "Codex CLI was not found. Expected codex on PATH, Codex.app, or a valid SSHcontroll Codex Path override." >&2
+    exit 127
+  fi
+  if [[ ! -d "$dir" ]]; then
+    echo "not a directory: $dir" >&2
+    exit 66
+  fi
+  if [[ -z "$prompt_file" || ! -s "$prompt_file" ]]; then
+    echo "missing prompt file for fresh Codex session" >&2
+    exit 66
+  fi
+  need_tmux
+  if [[ -n "$model" ]]; then
+    if ! [[ "$model" =~ '^[A-Za-z0-9._-]+$' ]]; then
+      echo "invalid codex model: $model" >&2
+      exit 66
+    fi
+  fi
+  if [[ -n "$effort" ]]; then
+    case "$effort" in
+      none|minimal|low|medium|high|xhigh) ;;
+      *)
+        echo "invalid codex reasoning effort: $effort" >&2
+        exit 66
+        ;;
+    esac
+  fi
+
+  prompt_text="$(cat "$prompt_file")"
+  tmux kill-session -t "$CODEX_SESSION" 2>/dev/null || true
+  local -a codex_args
+  codex_args=("$CODEX_BIN")
+  if [[ -n "$model" ]]; then
+    codex_args+=("-m" "$model")
+  fi
+  if [[ -n "$effort" ]]; then
+    codex_args+=("-c" "model_reasoning_effort=\"$effort\"")
+  fi
+  codex_add_runtime_args_if_needed
+  codex_args+=("$prompt_text")
+  tmux new-session -d -s "$CODEX_SESSION" -c "$dir" "${codex_args[@]}"
+  codex_mark_history ""
+  codex_mark_runtime "$(codex_runtime_mode_label)"
+  if ! wait_for_codex_input_ready "$CODEX_SESSION"; then
+    echo "$CODEX_SESSION did not become ready after fresh initial prompt" >&2
+    exit 70
+  fi
+  echo "$CODEX_SESSION started fresh in $dir with initial prompt"
+}
+
 restart_claude_in_dir() {
   local dir
   dir="$(read_path_arg)"
@@ -3713,8 +3935,10 @@ restart_claude_in_dir() {
     exit 127
   fi
   if [[ ! -d "$dir" ]]; then
-    echo "not a directory: $dir" >&2
-    exit 66
+    if ! mkdir -p -- "$dir" 2>/dev/null; then
+      echo "not a directory: $dir" >&2
+      exit 66
+    fi
   fi
   need_tmux
   if tmux has-session -t "$CLAUDE_SESSION" 2>/dev/null; then
@@ -3812,7 +4036,7 @@ ensure_codex_in_dir() {
       fi
     fi
     pane_text="$(tmux capture-pane -pJ -t "$CODEX_SESSION" -S -30 2>/dev/null || true)"
-    if [[ "$pane_text" == *"Working"* || "$pane_text" == *"esc to interrupt"* || "$pane_text" == *"tab to queue message"* ]]; then
+    if codex_queue_pane_is_busy "$pane_text"; then
       echo "$CODEX_SESSION is working in ${current_path:-unknown}. Finish or interrupt it before moving this session to $dir." >&2
       exit 65
     fi
@@ -3847,7 +4071,7 @@ ensure_codex_ready_for_send() {
     return 0
   fi
   pane_text="$(tmux capture-pane -pJ -t "$CODEX_SESSION" -S -30 2>/dev/null || true)"
-  if [[ "$pane_text" == *"Working"* || "$pane_text" == *"esc to interrupt"* || "$pane_text" == *"tab to queue message"* ]]; then
+  if codex_queue_pane_is_busy "$pane_text"; then
     return 0
   fi
   ensure_codex_in_dir "$model" "$effort" <<<"$dir"
@@ -3857,8 +4081,9 @@ ensure_codex_for_prompt() {
   local model="${1:-}"
   local effort="${2:-}"
   local history_id="${3:-$CODEX_HISTORY_ID}"
-  local dir current_path pane_text marker_id runtime_mode latest_id
+  local dir current_path pane_text marker_id runtime_mode latest_id force_new
   dir="$(read_path_arg)"
+  force_new="${A_COCKPIT_CODEX_FORCE_NEW:-0}"
   [[ -n "$dir" ]] || dir="$(session_start_dir)"
   if [[ ! -d "$dir" ]]; then
     echo "not a directory: $dir" >&2
@@ -3869,11 +4094,20 @@ ensure_codex_for_prompt() {
   if tmux has-session -t "$CODEX_SESSION" 2>/dev/null; then
     current_path="$(tmux display-message -p -t "$CODEX_SESSION" '#{pane_current_path}' 2>/dev/null || true)"
     pane_text="$(tmux capture-pane -pJ -t "$CODEX_SESSION" -S -30 2>/dev/null || true)"
-    if [[ "$pane_text" == *"Working"* || "$pane_text" == *"esc to interrupt"* || "$pane_text" == *"tab to queue message"* ]]; then
+    if codex_queue_pane_is_busy "$pane_text"; then
+      if [[ -z "$history_id" && ( "$force_new" == "1" || "$force_new" == "true" || "$force_new" == "yes" ) ]]; then
+        echo "$CODEX_SESSION is busy; fresh session start is waiting for idle runtime" >&2
+        exit 68
+      fi
       echo "$CODEX_SESSION already working in ${current_path:-unknown}"
       return 0
     fi
 
+    if [[ -z "$history_id" && ( "$force_new" == "1" || "$force_new" == "true" || "$force_new" == "yes" ) ]]; then
+      echo "$CODEX_SESSION fresh session requested; replacing idle runtime in ${current_path:-unknown}"
+      tmux kill-session -t "$CODEX_SESSION" 2>/dev/null || true
+      codex_mark_history ""
+    else
     marker_id="$(codex_current_history_marker)"
     runtime_mode="$(codex_current_runtime_marker)"
     if [[ "$current_path" == "$dir" ]]; then
@@ -3885,6 +4119,7 @@ ensure_codex_for_prompt() {
           return 0
         fi
       fi
+    fi
     fi
   fi
 
@@ -3899,9 +4134,10 @@ ensure_codex_for_prompt() {
 codex_latest_session_id_for_dir() {
   local dir="$1"
   local min_mtime="${2:-0}"
-  python3 - "$dir" "$min_mtime" <<'PY'
+python3 - "$dir" "$min_mtime" <<'PY'
 import json
 import datetime
+import os
 import pathlib
 import re
 import sqlite3
@@ -3919,6 +4155,31 @@ except Exception:
 
 base = pathlib.Path.home() / ".codex" / "sessions"
 matches = []
+exclude_ids = set(
+    match.lower()
+    for match in re.findall(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        os.environ.get("A_COCKPIT_CODEX_EXCLUDE_HISTORY_IDS", ""),
+    )
+)
+
+AUTOMATION_MARKERS = (
+    '"automation"',
+    "'automation'",
+    "codex-automation",
+    "automation id:",
+    "response must end with a remark-directive block",
+    "always include an inbox item directive",
+    "::inbox-item",
+)
+
+def is_automation_text(*values):
+    text = " ".join(str(value or "") for value in values).lower()
+    return any(marker in text for marker in AUTOMATION_MARKERS)
+
+def is_automation_meta(*values):
+    normalized = [str(value or "").strip().lower() for value in values]
+    return any(value == "automation" for value in normalized) or is_automation_text(*values)
 
 state_db = pathlib.Path.home() / ".codex" / "state_5.sqlite"
 if state_db.exists():
@@ -3929,7 +4190,11 @@ if state_db.exists():
             ):
                 if not session_id:
                     continue
+                if str(session_id).lower() in exclude_ids:
+                    continue
                 if str(thread_source or "").lower() == "subagent" or "subagent" in str(source or "").lower():
+                    continue
+                if is_automation_meta(source, thread_source):
                     continue
                 title_text = " ".join(str(title or "").split()).lower()
                 if title_text.startswith("/status") or title_text == "status":
@@ -3973,6 +4238,9 @@ for path in base.glob("**/*.jsonl"):
                     if str(meta.get("thread_source") or "").lower() == "subagent" or "subagent" in source_text.lower():
                         meta = {"_skip": True}
                         break
+                    if is_automation_meta(source_text, meta.get("thread_source")):
+                        meta = {"_skip": True}
+                        break
                     continue
                 if obj.get("type") == "response_item":
                     payload = obj.get("payload") or {}
@@ -3986,6 +4254,8 @@ for path in base.glob("**/*.jsonl"):
     except Exception:
         continue
     if meta.get("_skip"):
+        continue
+    if is_automation_text(first_user):
         continue
     if first_user.lstrip().startswith('"/status') or "/status" in first_user[:200]:
         continue
@@ -4001,6 +4271,8 @@ for path in base.glob("**/*.jsonl"):
     if min_mtime and stat.st_mtime < min_mtime:
         continue
     session_id = meta.get("id") or path.stem.split("-")[-1]
+    if str(session_id).lower() in exclude_ids:
+        continue
     matches.append((stat.st_mtime, session_id))
 
 if matches:
@@ -4019,6 +4291,9 @@ codex_sync_history_record() {
   local model="${3:-}"
   local effort="${4:-}"
   local title_hint="${5:-}"
+  if [[ "${A_COCKPIT_CODEX_ALLOW_STATE_SYNC:-}" != "1" && "${A_COCKPIT_CODEX_ALLOW_STATE_REPAIR:-}" != "1" ]]; then
+    return 0
+  fi
   [[ -n "$session_id" ]] || return 1
   [[ -n "$dir" ]] || dir="$(session_start_dir)"
   python3 - "$session_id" "$dir" "$model" "$effort" "$title_hint" <<'PY'
@@ -4064,6 +4339,24 @@ def good_title(value):
     if len(clean) > 96:
         clean = clean[:93].rstrip() + "..."
     return clean
+
+AUTOMATION_MARKERS = (
+    '"automation"',
+    "'automation'",
+    "codex-automation",
+    "automation id:",
+    "response must end with a remark-directive block",
+    "always include an inbox item directive",
+    "::inbox-item",
+)
+
+def is_automation_text(*values):
+    text = " ".join(str(value or "") for value in values).lower()
+    return any(marker in text for marker in AUTOMATION_MARKERS)
+
+def is_automation_meta(*values):
+    normalized = [str(value or "").strip().lower() for value in values]
+    return any(value == "automation" for value in normalized) or is_automation_text(*values)
 
 def content_text(value):
     pieces = []
@@ -4334,7 +4627,7 @@ resume_codex_latest_in_dir() {
   if tmux has-session -t "$CODEX_SESSION" 2>/dev/null; then
     current_path="$(tmux display-message -p -t "$CODEX_SESSION" '#{pane_current_path}' 2>/dev/null || true)"
     pane_text="$(tmux capture-pane -pJ -t "$CODEX_SESSION" -S -30 2>/dev/null || true)"
-    if [[ "$pane_text" == *"Working"* || "$pane_text" == *"esc to interrupt"* || "$pane_text" == *"tab to queue message"* ]]; then
+    if codex_queue_pane_is_busy "$pane_text"; then
       echo "$CODEX_SESSION is working in ${current_path:-unknown}. Finish or interrupt it before resuming the Codex.app conversation for $dir." >&2
       exit 65
     fi
@@ -4406,7 +4699,7 @@ resume_codex_session_in_dir() {
   if tmux has-session -t "$CODEX_SESSION" 2>/dev/null; then
     current_path="$(tmux display-message -p -t "$CODEX_SESSION" '#{pane_current_path}' 2>/dev/null || true)"
     pane_text="$(tmux capture-pane -pJ -t "$CODEX_SESSION" -S -30 2>/dev/null || true)"
-    if [[ "$pane_text" == *"Working"* || "$pane_text" == *"esc to interrupt"* || "$pane_text" == *"tab to queue message"* ]]; then
+    if codex_queue_pane_is_busy "$pane_text"; then
       echo "$CODEX_SESSION is working in ${current_path:-unknown}. Finish or interrupt it before switching to Codex history $session_id." >&2
       exit 65
     fi
@@ -4440,15 +4733,20 @@ codex_history_json() {
     dir="$HOME/${dir#\~/}"
   fi
   [[ -z "$dir" ]] && dir="$(session_start_dir)"
-  local cache_dir cache_key cache_file cache_mtime cache_age tmp_file
+  local history_scope include_all_flag cache_dir cache_key cache_file cache_mtime cache_age tmp_file
+  history_scope="${A_COCKPIT_CODEX_HISTORY_SCOPE:-directory}"
+  include_all_flag="${A_COCKPIT_CODEX_HISTORY_ALL:-0}"
+  case "$history_scope" in
+    all|global|home) include_all_flag=1 ;;
+  esac
   cache_dir="$HOME/.cache/sshcontroll"
   mkdir -p -- "$cache_dir" 2>/dev/null || true
-  cache_key="$(printf '%s' "$dir" | shasum -a 1 | awk '{print $1}')"
+  cache_key="$(printf '%s:%s:%s' "$include_all_flag" "$history_scope" "$dir" | shasum -a 1 | awk '{print $1}')"
   cache_file="$cache_dir/codex-history-${cache_key}.json"
   if [[ -z "${A_COCKPIT_CODEX_HISTORY_FORCE:-}" && -s "$cache_file" ]]; then
     cache_mtime="$(stat -f %m "$cache_file" 2>/dev/null || echo 0)"
     cache_age=$(( $(date +%s) - cache_mtime ))
-    if (( cache_age >= 0 && cache_age <= 6 )); then
+    if (( cache_age >= 0 && cache_age <= 2 )); then
       cat "$cache_file"
       return 0
     fi
@@ -4462,6 +4760,7 @@ import pathlib
 import re
 import sqlite3
 import sys
+import time
 
 target = pathlib.Path(sys.argv[1]).expanduser()
 try:
@@ -4469,6 +4768,10 @@ try:
 except Exception:
     pass
 host = str(os.environ.get("A_COCKPIT_CODEX_HISTORY_HOST") or "remote").strip().lower() or "remote"
+scope = str(os.environ.get("A_COCKPIT_CODEX_HISTORY_SCOPE") or "directory").strip().lower()
+include_all = scope in {"all", "global", "home"} or str(os.environ.get("A_COCKPIT_CODEX_HISTORY_ALL") or "").strip().lower() in {
+    "1", "true", "yes", "all"
+}
 
 base = pathlib.Path.home() / ".codex" / "sessions"
 sqlite_titles = {}
@@ -4479,6 +4782,29 @@ state_db = pathlib.Path.home() / ".codex" / "state_5.sqlite"
 index_path = pathlib.Path.home() / ".codex" / "session_index.jsonl"
 index_titles = {}
 index_times = {}
+
+def repair_thread_visibility(conn):
+    if str(os.environ.get("A_COCKPIT_CODEX_ALLOW_STATE_REPAIR") or "").strip().lower() not in {
+        "1", "true", "yes"
+    }:
+        return
+    try:
+        conn.execute(
+            """
+            update threads
+            set has_user_event = 1
+            where coalesce(archived,0) = 0
+              and coalesce(has_user_event,0) = 0
+              and (
+                length(coalesce(first_user_message,'')) > 0
+                or length(coalesce(preview,'')) > 0
+                or length(coalesce(title,'')) > 0
+              )
+            """
+        )
+        conn.commit()
+    except Exception:
+        pass
 
 def good_title(value):
     clean = " ".join(str(value or "").split())
@@ -4503,6 +4829,12 @@ def good_title(value):
             "a_queue_",
             "process running with session id",
             "steer the current codex work with this instruction",
+            "response must end with a remark-directive block",
+            "always include an inbox item directive",
+            "::inbox-item",
+            "automation id:",
+            "turn_aborted",
+            "user interrupted the previous turn",
             "basename:",
             "first line:",
             "smoke-test marker",
@@ -4565,6 +4897,62 @@ def item_text_for_title(payload):
             return text
     return ""
 
+latest_title_cache = {}
+
+def good_recent_title(value):
+    title = good_title(value)
+    if not title:
+        return ""
+    lower = title.lower()
+    if lower in {"ok", "yes", "no", "y", "n", "ㅇㅇ", "ㄱㄱ", "응", "어", "네"}:
+        return ""
+    if len(title) < 6:
+        return ""
+    return title
+
+def tail_lines(path, max_bytes=1048576):
+    try:
+        stat = path.stat()
+        with path.open("rb") as handle:
+            offset = max(0, stat.st_size - max_bytes)
+            handle.seek(offset)
+            data = handle.read(max_bytes)
+    except Exception:
+        return []
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if lines and stat.st_size > max_bytes:
+        lines = lines[1:]
+    return lines
+
+def latest_user_title_from_path(path):
+    key = str(path)
+    if key in latest_title_cache:
+        return latest_title_cache[key]
+    latest_title_cache[key] = ""
+    if not path.exists():
+        return ""
+    for line in reversed(tail_lines(path)):
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if obj.get("type") != "response_item":
+            continue
+        payload = obj.get("payload") or {}
+        item = payload.get("item")
+        source = item if isinstance(item, dict) else payload
+        role = (source.get("role") or payload.get("role") or "").lower()
+        kind = (source.get("type") or payload.get("type") or "").lower()
+        if role != "user" and kind not in ("user_message", "input_text"):
+            continue
+        text = item_text_for_title(source) or item_text_for_title(payload)
+        title = good_recent_title(text)
+        if title:
+            latest_title_cache[key] = title
+            return title
+    return ""
+
 def parse_index_time(value):
     text = str(value or "").strip()
     if not text:
@@ -4593,6 +4981,8 @@ def path_is_relative_to(path, parent):
         return False
 
 def path_matches_target(value):
+    if include_all:
+        return True
     path = normalized_path(value)
     if path is None:
         return False
@@ -4621,6 +5011,7 @@ if index_path.exists():
 if state_db.exists():
     try:
         with sqlite3.connect(str(state_db)) as conn:
+            repair_thread_visibility(conn)
             for session_id, cwd, title, rollout_path, source, thread_source, agent_role in conn.execute(
                 "select id, cwd, title, rollout_path, source, coalesce(thread_source,''), coalesce(agent_role,'') from threads"
             ):
@@ -4631,9 +5022,7 @@ if state_db.exists():
                 agent_role = str(agent_role or "")
                 if thread_source.lower() == "subagent" or "subagent" in source.lower():
                     continue
-                clean_title = good_title(title) or index_titles.get(session_id, "")
-                if clean_title:
-                    sqlite_titles[session_id] = clean_title
+                is_auto_thread = is_automation_meta(source, thread_source, agent_role)
                 sqlite_meta[session_id] = {
                     "source": source,
                     "thread_source": thread_source,
@@ -4644,6 +5033,17 @@ if state_db.exists():
                     sqlite_paths[expanded_rollout_path] = session_id
                 else:
                     expanded_rollout_path = ""
+                latest_title = (
+                    latest_user_title_from_path(pathlib.Path(expanded_rollout_path))
+                    if expanded_rollout_path else ""
+                )
+                db_title = good_title(title)
+                if is_auto_thread:
+                    clean_title = db_title or index_titles.get(session_id, "") or latest_title
+                else:
+                    clean_title = latest_title or db_title or index_titles.get(session_id, "")
+                if clean_title:
+                    sqlite_titles[session_id] = clean_title
                 mtime = int(state_db.stat().st_mtime)
                 if expanded_rollout_path:
                     try:
@@ -4651,11 +5051,12 @@ if state_db.exists():
                     except Exception:
                         pass
                 mtime = max(mtime, index_times.get(session_id, 0))
-                if not path_matches_target(cwd):
+                display_cwd = str(cwd or "").strip() or str(target)
+                if not include_all and not path_matches_target(cwd):
                     continue
                 sqlite_records.append({
                     "id": str(session_id),
-                    "cwd": cwd or str(target),
+                    "cwd": display_cwd,
                     "path": expanded_rollout_path,
                     "mtime": mtime,
                     "title": clean_title or "Codex session",
@@ -4665,18 +5066,41 @@ if state_db.exists():
                 })
     except Exception:
         pass
-records = []
-for path in base.glob("**/*.jsonl"):
+records = list(sqlite_records)
+seen_paths = {
+    str(pathlib.Path(record.get("path") or "").expanduser())
+    for record in records
+    if record.get("path")
+}
+scan_paths = []
+if base.exists():
     try:
-        stat = path.stat()
-    except OSError:
+        now = time.time()
+        for path in base.glob("**/*.jsonl"):
+            if str(path) in seen_paths:
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if now - stat.st_mtime > 7 * 86400:
+                continue
+            scan_paths.append((stat.st_mtime, path, stat))
+        scan_paths.sort(key=lambda item: item[0], reverse=True)
+        scan_paths = scan_paths[:50]
+    except Exception:
+        scan_paths = []
+for _, path, stat in scan_paths:
+    if str(path) in seen_paths:
         continue
     meta = {}
     title = ""
     first_user_title = ""
     try:
         with path.open(errors="replace") as handle:
+            line_count = 0
             for line in handle:
+                line_count += 1
                 try:
                     obj = json.loads(line)
                 except Exception:
@@ -4699,11 +5123,16 @@ for path in base.glob("**/*.jsonl"):
                     event_title = good_title(message)
                     if event_title and not title:
                         title = event_title
+                if line_count >= 320 and meta and (first_user_title or title):
+                    break
     except Exception:
         continue
 
     cwd = meta.get("cwd") or ""
-    if not cwd:
+    if meta.get("_skip"):
+        continue
+    display_cwd = str(cwd or "").strip() or str(target)
+    if not cwd and not include_all:
         continue
     if not path_matches_target(cwd):
         continue
@@ -4719,10 +5148,11 @@ for path in base.glob("**/*.jsonl"):
     if str(meta_source.get("thread_source") or "").lower() == "subagent" or "subagent" in str(meta_source.get("source") or "").lower():
         continue
     indexed_title = index_titles.get(session_id) or index_titles.get(sqlite_session_id)
-    selected_title = sqlite_title or indexed_title or first_user_title or title or "Codex session"
+    latest_user_title = latest_user_title_from_path(path)
+    selected_title = latest_user_title or sqlite_title or indexed_title or first_user_title or title or "Codex session"
     records.append({
         "id": session_id,
-        "cwd": cwd,
+        "cwd": display_cwd,
         "path": str(path),
         "mtime": max(int(stat.st_mtime), index_times.get(session_id, 0), index_times.get(sqlite_session_id, 0)),
         "title": selected_title,
@@ -4752,8 +5182,22 @@ PY
 }
 
 codex_history_status_json() {
-  python3 <<'PY'
+  local cache_dir cache_file cache_mtime cache_age tmp_file
+  cache_dir="$HOME/.cache/sshcontroll"
+  mkdir -p -- "$cache_dir" 2>/dev/null || true
+  cache_file="$cache_dir/codex-history-status.json"
+  if [[ -z "${A_COCKPIT_CODEX_STATUS_FORCE:-}" && -s "$cache_file" ]]; then
+    cache_mtime="$(stat -f %m "$cache_file" 2>/dev/null || echo 0)"
+    cache_age=$(( $(date +%s) - cache_mtime ))
+    if (( cache_age >= 0 && cache_age <= 2 )); then
+      cat "$cache_file"
+      return 0
+    fi
+  fi
+  tmp_file="$(mktemp "${TMPDIR:-/tmp}/sshcontroll-codex-status.XXXXXX")" || exit 74
+  if python3 >"$tmp_file" <<'PY'
 import json
+import os
 import pathlib
 import re
 import sqlite3
@@ -4765,8 +5209,59 @@ state_db = pathlib.Path.home() / ".codex" / "state_5.sqlite"
 items = []
 tmux_by_id = {}
 candidate_paths = {}
+now = time.time()
+try:
+    max_db_candidates = int(os.environ.get("A_COCKPIT_CODEX_STATUS_DB_LIMIT", "120"))
+except Exception:
+    max_db_candidates = 120
+max_db_candidates = max(30, min(max_db_candidates, 250))
+try:
+    max_fs_candidates = int(os.environ.get("A_COCKPIT_CODEX_STATUS_FS_LIMIT", "50"))
+except Exception:
+    max_fs_candidates = 50
+max_fs_candidates = max(10, min(max_fs_candidates, 120))
+try:
+    tail_bytes = int(os.environ.get("A_COCKPIT_CODEX_STATUS_TAIL_BYTES", "393216"))
+except Exception:
+    tail_bytes = 393216
+tail_bytes = max(65536, min(tail_bytes, 1048576))
+head_bytes = 65536
 
-def add_candidate(path_value, session_id=""):
+def display_title(value):
+    raw = str(value or "").replace("\x00", "").strip()
+    if not raw:
+        return ""
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = re.match(r"^Automation:\s*(.+)$", line, re.I)
+        if match:
+            return match.group(1).strip()[:160].strip()
+    clean = " ".join(raw.split())
+    lower = clean.lower()
+    if "automation id:" in lower and re.match(r"^Automation:", clean, re.I):
+        clean = clean.split("Automation ID:", 1)[0].strip()
+        clean = re.sub(r"^Automation:\s*", "", clean, flags=re.I).strip()
+        return clean[:160].strip()
+    if len(clean) > 220 and (
+        "automation id:" in lower
+        or "response must end with a remark-directive block" in lower
+        or "::inbox-item" in lower
+    ):
+        return ""
+    return clean[:220].strip()
+
+def add_candidate(
+    path_value,
+    session_id="",
+    priority=0,
+    mtime=0,
+    cwd="",
+    title="",
+    source="",
+    thread_source="",
+):
     if not path_value:
         return
     try:
@@ -4774,10 +5269,107 @@ def add_candidate(path_value, session_id=""):
     except Exception:
         return
     key = str(path)
-    if key not in candidate_paths:
-        candidate_paths[key] = {"path": path, "id": str(session_id or "")}
-    elif session_id and not candidate_paths[key].get("id"):
-        candidate_paths[key]["id"] = str(session_id)
+    existing = candidate_paths.get(key)
+    if existing is None:
+        candidate_paths[key] = {
+            "path": path,
+            "id": str(session_id or ""),
+            "priority": int(priority),
+            "mtime": float(mtime or 0),
+            "cwd": str(cwd or ""),
+            "title": display_title(title),
+            "source": str(source or ""),
+            "thread_source": str(thread_source or ""),
+        }
+        return
+    if session_id and not existing.get("id"):
+        existing["id"] = str(session_id)
+    existing["priority"] = max(int(existing.get("priority") or 0), int(priority))
+    existing["mtime"] = max(float(existing.get("mtime") or 0), float(mtime or 0))
+    if cwd and not existing.get("cwd"):
+        existing["cwd"] = str(cwd)
+    if title and not existing.get("title"):
+        existing["title"] = display_title(title)
+    if source and not existing.get("source"):
+        existing["source"] = str(source)
+    if thread_source and not existing.get("thread_source"):
+        existing["thread_source"] = str(thread_source)
+
+def repair_thread_visibility(conn):
+    if str(os.environ.get("A_COCKPIT_CODEX_ALLOW_STATE_REPAIR") or "").strip().lower() not in {
+        "1", "true", "yes"
+    }:
+        return
+    try:
+        conn.execute(
+            """
+            update threads
+            set has_user_event = 1
+            where coalesce(archived,0) = 0
+              and coalesce(has_user_event,0) = 0
+              and (
+                length(coalesce(first_user_message,'')) > 0
+                or length(coalesce(preview,'')) > 0
+                or length(coalesce(title,'')) > 0
+              )
+            """
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+def read_head_lines(path, max_lines=80):
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(head_bytes)
+        return data.decode("utf-8", errors="replace").splitlines()[:max_lines]
+    except Exception:
+        return []
+
+def read_tail_lines(path, max_lines=420):
+    try:
+        size = path.stat().st_size
+        start = max(0, size - tail_bytes)
+        with path.open("rb") as handle:
+            handle.seek(start)
+            data = handle.read(tail_bytes)
+        if start > 0:
+            newline = data.find(b"\n")
+            if newline >= 0:
+                data = data[newline + 1:]
+        return data.decode("utf-8", errors="replace").splitlines()[-max_lines:]
+    except Exception:
+        return []
+
+def item_source(payload):
+    if not isinstance(payload, dict):
+        return {}
+    item = payload.get("item")
+    return item if isinstance(item, dict) else payload
+
+def compact_json_text(value):
+    try:
+        return json.dumps(value, ensure_ascii=False).lower()
+    except Exception:
+        return str(value or "").lower()
+
+AUTOMATION_MARKERS = (
+    '"automation"',
+    "'automation'",
+    "codex-automation",
+    "automation id:",
+    "response must end with a remark-directive block",
+    "always include an inbox item directive",
+    "::inbox-item",
+)
+
+def is_automation_text(*values):
+    text = " ".join(str(value or "") for value in values).lower()
+    return any(marker in text for marker in AUTOMATION_MARKERS)
+
+def is_automation_meta(*values):
+    normalized = [str(value or "").strip().lower() for value in values]
+    return any(value == "automation" for value in normalized) or is_automation_text(*values)
 
 try:
     tmux = subprocess.run(
@@ -4785,7 +5377,7 @@ try:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-        timeout=2,
+        timeout=1.2,
     )
     if tmux.returncode == 0:
         for row in tmux.stdout.splitlines():
@@ -4796,11 +5388,11 @@ try:
             if "codex" not in session_name.lower() and "codex" not in pane_command.lower():
                 continue
             capture = subprocess.run(
-                ["tmux", "capture-pane", "-pJ", "-t", pane_id, "-S", "-180"],
+                ["tmux", "capture-pane", "-pJ", "-t", pane_id, "-S", "-80"],
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                timeout=2,
+                timeout=1.2,
             )
             pane_text = capture.stdout if capture.returncode == 0 else ""
             lower = pane_text.lower()
@@ -4833,49 +5425,78 @@ try:
 except Exception:
     pass
 
-if base.exists():
-    for path in base.glob("**/*.jsonl"):
-        add_candidate(str(path))
-
 if state_db.exists():
     try:
         with sqlite3.connect(str(state_db)) as conn:
-            for session_id, rollout_path in conn.execute("select id, rollout_path from threads"):
-                add_candidate(rollout_path, session_id)
+            repair_thread_visibility(conn)
+            query = (
+                "select id, rollout_path, coalesce(updated_at,0), "
+                "coalesce(cwd,''), coalesce(title,''), coalesce(source,''), coalesce(thread_source,'') "
+                "from threads where coalesce(archived,0)=0 "
+                "and lower(coalesce(thread_source,'')) != 'subagent' "
+                "and lower(coalesce(source,'')) not like '%subagent%' "
+                "order by updated_at desc limit ?"
+            )
+            for session_id, rollout_path, updated_at, cwd, title, source, thread_source in conn.execute(
+                query, (max_db_candidates,)
+            ):
+                add_candidate(
+                    rollout_path,
+                    session_id,
+                    priority=3,
+                    mtime=updated_at or 0,
+                    cwd=cwd,
+                    title=title,
+                    source=source,
+                    thread_source=thread_source,
+                )
     except Exception:
         pass
 
+if base.exists():
+    fs_paths = []
+    try:
+        for path in base.glob("**/*.jsonl"):
+            try:
+                stat = path.stat()
+            except Exception:
+                continue
+            if now - stat.st_mtime > 7 * 86400:
+                continue
+            fs_paths.append((stat.st_mtime, path))
+        fs_paths.sort(key=lambda item: item[0], reverse=True)
+        fs_paths = fs_paths[:max_fs_candidates]
+    except Exception:
+        fs_paths = []
+    for mtime, path in fs_paths:
+        add_candidate(str(path), priority=1, mtime=mtime)
+
+ordered_candidates = []
 for candidate in candidate_paths.values():
+    path = candidate["path"]
+    try:
+        stat = path.stat()
+    except Exception:
+        continue
+    candidate["mtime"] = max(float(candidate.get("mtime") or 0), float(stat.st_mtime))
+    candidate["stat"] = stat
+    ordered_candidates.append(candidate)
+ordered_candidates.sort(
+    key=lambda item: (int(item.get("priority") or 0), float(item.get("mtime") or 0)),
+    reverse=True,
+)
+
+for candidate in ordered_candidates[:250]:
         path = candidate["path"]
-        if not path.exists():
-            continue
-        try:
-            stat = path.stat()
-        except Exception:
-            continue
+        stat = candidate.get("stat")
+        if stat is None:
+            try:
+                stat = path.stat()
+            except Exception:
+                continue
         session_id = candidate.get("id") or path.stem
-        try:
-            head_proc = subprocess.run(
-                ["head", "-n", "80", str(path)],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                timeout=1,
-            )
-            head_lines = head_proc.stdout.splitlines() if head_proc.returncode == 0 else []
-        except Exception:
-            head_lines = []
-        try:
-            tail_proc = subprocess.run(
-                ["tail", "-n", "420", str(path)],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                timeout=2,
-            )
-            tail_lines = tail_proc.stdout.splitlines() if tail_proc.returncode == 0 else []
-        except Exception:
-            tail_lines = []
+        head_lines = read_head_lines(path)
+        tail_lines = read_tail_lines(path)
         last_turn_index = -1
         last_user_index = -1
         last_complete_index = -1
@@ -4887,7 +5508,8 @@ for candidate in candidate_paths.values():
             except Exception:
                 continue
             if obj.get("type") == "session_meta":
-                meta_id = (obj.get("payload") or {}).get("id")
+                meta_payload = obj.get("payload") or {}
+                meta_id = meta_payload.get("id")
                 if meta_id:
                     session_id = meta_id
                 break
@@ -4897,6 +5519,10 @@ for candidate in candidate_paths.values():
             except Exception:
                 continue
             payload = obj.get("payload") or {}
+            source = item_source(payload)
+            source_role = str(source.get("role") or payload.get("role") or "").lower()
+            source_kind = str(source.get("type") or payload.get("type") or "").lower()
+            source_phase = str(source.get("phase") or payload.get("phase") or "").lower()
             if obj.get("type") == "turn_context":
                 last_turn_index = index
             elif obj.get("type") == "event_msg":
@@ -4904,7 +5530,7 @@ for candidate in candidate_paths.values():
                 if payload_type == "task_complete":
                     last_complete_index = index
                 elif payload_type not in {"token_count"}:
-                    live_text = json.dumps(payload, ensure_ascii=False).lower()
+                    live_text = compact_json_text(payload)
                     if any(marker in live_text for marker in [
                         "working", "thinking", "exec_command", "tool_call",
                         "patch_apply", "function_call", "spawn_agent", "waited",
@@ -4913,18 +5539,19 @@ for candidate in candidate_paths.values():
                         latest_live_index = index
                         latest_live_text = live_text
             elif obj.get("type") == "response_item":
-                if payload.get("role") == "user":
+                if source_role == "user" or source_kind in ("user_message", "input_text"):
                     last_user_index = index
-                if payload.get("role") == "assistant" and payload.get("phase") == "final_answer":
+                if source_role == "assistant" and source_phase in {"final_answer", "final"}:
                     last_complete_index = index
                     continue
-                live_text = json.dumps(payload, ensure_ascii=False).lower()
+                live_text = compact_json_text(source if source else payload)
                 if any(marker in live_text for marker in [
                     "function_call", "custom_tool_call", "apply_patch", "exec_command",
                     "reasoning", "spawn_agent", "wait_agent", "tool_call",
                 ]) or (
-                    payload.get("role") == "assistant"
-                    and payload.get("phase") not in {"final_answer", "final"}
+                    source_role == "assistant"
+                    and source_phase not in {"final_answer", "final"}
+                    and source_kind not in {"message", "output_text"}
                 ):
                     latest_live_index = index
                     latest_live_text = live_text
@@ -4955,7 +5582,11 @@ for candidate in candidate_paths.values():
             "mtime": int(stat.st_mtime),
             "tmux": bool(tmux_by_id.get(session_id, {}).get("tmux", False)),
             "session_name": tmux_by_id.get(session_id, {}).get("session_name", ""),
-            "cwd": tmux_by_id.get(session_id, {}).get("cwd", ""),
+            "cwd": tmux_by_id.get(session_id, {}).get("cwd", "") or candidate.get("cwd", ""),
+            "path": str(path),
+            "title": candidate.get("title", ""),
+            "source": candidate.get("source", ""),
+            "thread_source": candidate.get("thread_source", ""),
         })
         tmux_by_id.pop(session_id, None)
 for session_id, status in tmux_by_id.items():
@@ -4970,6 +5601,72 @@ for session_id, status in tmux_by_id.items():
 items.sort(key=lambda item: item["mtime"], reverse=True)
 print(json.dumps(items[:250], ensure_ascii=False))
 PY
+  then
+    cat "$tmp_file"
+    mv -f -- "$tmp_file" "$cache_file" 2>/dev/null || rm -f -- "$tmp_file"
+  else
+    local rc=$?
+    cat "$tmp_file" 2>/dev/null || true
+    rm -f -- "$tmp_file"
+    return "$rc"
+  fi
+}
+
+codex_history_repair_index() {
+  python3 <<'PY'
+import json
+import os
+import pathlib
+import sqlite3
+import time
+
+state_db = pathlib.Path.home() / ".codex" / "state_5.sqlite"
+result = {"db": str(state_db), "updated": 0, "ok": False}
+allow_write = str(os.environ.get("A_COCKPIT_CODEX_ALLOW_STATE_REPAIR") or "").strip().lower() in {
+    "1", "true", "yes"
+}
+if not allow_write:
+    result["disabled"] = True
+    result["error"] = "Codex state repair is disabled; SSHcontroll keeps A-side Codex state read-only."
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(75)
+if not state_db.exists():
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(0)
+
+try:
+    backup = state_db.with_name(
+        f"{state_db.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}-before-history-repair"
+    )
+    backup.write_bytes(state_db.read_bytes())
+    with sqlite3.connect(str(state_db)) as conn:
+        cursor = conn.execute(
+            """
+            update threads
+            set has_user_event = 1
+            where coalesce(archived,0) = 0
+              and coalesce(has_user_event,0) = 0
+              and (
+                length(coalesce(first_user_message,'')) > 0
+                or length(coalesce(preview,'')) > 0
+                or length(coalesce(title,'')) > 0
+              )
+            """
+        )
+        result["updated"] = cursor.rowcount if cursor.rowcount is not None else 0
+        conn.commit()
+        try:
+            conn.execute("pragma wal_checkpoint(truncate)")
+            conn.commit()
+        except Exception as exc:
+            result["checkpoint_warning"] = str(exc)
+    result["backup"] = str(backup)
+    result["ok"] = True
+except Exception as exc:
+    result["error"] = str(exc)
+
+print(json.dumps(result, ensure_ascii=False))
+PY
 }
 
 codex_history_transcript() {
@@ -4978,6 +5675,7 @@ codex_history_transcript() {
   path_hint="$(cat 2>/dev/null || true)"
   python3 - "$session_id" "$path_hint" <<'PY'
 import json
+import os
 import pathlib
 import re
 import sqlite3
@@ -4985,12 +5683,17 @@ import sys
 
 session_id = (sys.argv[1] or "").strip()
 path_hint = (sys.argv[2] or "").strip()
+try:
+    max_tail_bytes = int(os.environ.get("A_COCKPIT_CODEX_TRANSCRIPT_TAIL_BYTES", "4194304"))
+except Exception:
+    max_tail_bytes = 4194304
+max_tail_bytes = max(1048576, min(max_tail_bytes, 67108864))
 
 def candidate_paths():
     seen = set()
     if path_hint:
         p = pathlib.Path(path_hint).expanduser()
-        if p.exists():
+        if p.exists() and p.is_file():
             seen.add(str(p))
             yield p
     state_db = pathlib.Path.home() / ".codex" / "state_5.sqlite"
@@ -5074,6 +5777,14 @@ def item_text(payload):
 
 def strip_hidden_prompt_context(text):
     value = str(text or "")
+    lower_value = value.lower()
+    if re.match(r"(?is)^\s*<heartbeat>\s*.*?</heartbeat>\s*$", value):
+        return ""
+    if (
+        "response must end with a remark-directive block" in lower_value
+        or ("always include an inbox item directive" in lower_value and "::inbox-item" in lower_value)
+    ):
+        return ""
     value = re.sub(r"(?is)<oai-mem-citation>.*?</oai-mem-citation>", "\n", value)
     value = re.sub(r"(?is)<environment_context\b[^>]*>.*?</environment_context>", "\n", value)
     value = re.sub(r"(?is)<(?:subagent_notification|agent_notification)\b[^>]*>.*?</(?:subagent_notification|agent_notification)>", "\n", value)
@@ -5139,6 +5850,8 @@ def strip_hidden_prompt_context(text):
             or comparable.startswith("process exited with code")
             or comparable.startswith("process running with session id")
             or comparable.startswith("original token count:")
+            or "turn_aborted" in comparable
+            or "user interrupted the previous turn" in comparable
             or comparable.startswith("queued professor lab:")
             or comparable.startswith("research run: research_loops/")
             or "autonomous research stages are staged on a queue" in comparable
@@ -5168,6 +5881,21 @@ def normalize_for_echo(text):
     value = re.sub(r"^[›>•]\s*", "", value)
     return " ".join(value.split()).strip()
 
+def brief_user_title(text):
+    value = normalize_for_echo(text)
+    if not value:
+        return ""
+    lower = value.lower()
+    if value.startswith("<") or "turn_aborted" in lower or "user interrupted the previous turn" in lower:
+        return ""
+    if lower in {"ok", "yes", "no", "y", "n", "ㅇㅇ", "ㄱㄱ", "응", "어", "네"}:
+        return ""
+    if len(value) < 6:
+        return ""
+    if len(value) > 120:
+        value = value[:117].rstrip() + "..."
+    return value
+
 path = next(candidate_paths(), None)
 if path is None:
     print(f"Codex history transcript not found for {session_id}", file=sys.stderr)
@@ -5177,6 +5905,22 @@ rows = []
 title = ""
 cwd = ""
 last_normalized = ""
+latest_user_title = ""
+transcript_truncated = False
+transcript_size = 0
+
+state_db = pathlib.Path.home() / ".codex" / "state_5.sqlite"
+if session_id and state_db.exists():
+    try:
+        with sqlite3.connect(str(state_db)) as conn:
+            for db_title, db_cwd in conn.execute(
+                "select title, cwd from threads where id = ?", (session_id,)
+            ):
+                title = db_title or title
+                cwd = db_cwd or cwd
+                break
+    except Exception:
+        pass
 
 def append_row(value):
     global last_normalized
@@ -5189,56 +5933,164 @@ def append_row(value):
     rows.append(text)
     last_normalized = normalized
 
+def compact_one_line(value, limit=180):
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) > limit:
+        return text[: max(0, limit - 3)].rstrip() + "..."
+    return text
+
+def parsed_json_argument(value):
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+def function_call_summary(source):
+    if not isinstance(source, dict):
+        return ""
+    name = str(source.get("name") or "").strip()
+    if not name:
+        return ""
+    args = parsed_json_argument(source.get("arguments"))
+    if name == "exec_command":
+        cmd = str(args.get("cmd") or "").strip()
+        workdir = str(args.get("workdir") or "").strip()
+        if not cmd:
+            return "• Ran shell command"
+        raw_command_lines = [line.strip() for line in cmd.splitlines() if line.strip()]
+        command_lines = [
+            line
+            for line in raw_command_lines
+            if not line.startswith("set -")
+            and not (line.startswith("export ") and "=" in line and len(raw_command_lines) > 1)
+            and not (re.match(r"^[A-Z_][A-Z0-9_]*=", line) and len(raw_command_lines) > 1)
+        ]
+        head = (command_lines[0] if command_lines else cmd.splitlines()[0].strip())
+        reader = re.search(r"(^|[\s;|&])(rg|sed|cat|find|ls|tail|head|wc|nl|stat|file)\b", head)
+        label = "Explored" if reader else "Ran"
+        detail = compact_one_line(head)
+        if workdir and workdir not in detail:
+            detail = f"{detail}\n{workdir}"
+        return f"• {label} {detail}"
+    if name == "view_image":
+        path = str(args.get("path") or "").strip()
+        return "• Viewed image" + (f"\n{path}" if path else "")
+    if name == "apply_patch":
+        return "• Edited files"
+    if name in {"write_stdin", "exec"}:
+        return ""
+    return f"• Called {name}"
+
+def history_lines(path):
+    global transcript_truncated, transcript_size
+    transcript_size = path.stat().st_size
+    if transcript_size <= max_tail_bytes:
+        with path.open(errors="replace") as handle:
+            for line in handle:
+                yield line
+        return
+
+    transcript_truncated = True
+    with path.open("rb") as handle:
+        offset = max(0, transcript_size - max_tail_bytes)
+        handle.seek(offset)
+        data = handle.read(max_tail_bytes)
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if offset > 0 and lines:
+        lines = lines[1:]
+    for line in lines:
+        yield line
+
 try:
-    with path.open(errors="replace") as handle:
-        for line in handle:
-            try:
-                obj = json.loads(line)
-            except Exception:
+    for line in history_lines(path):
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        typ = obj.get("type") or ""
+        payload = obj.get("payload") or {}
+        if typ == "session_meta":
+            title = payload.get("title") or title
+            cwd = payload.get("cwd") or cwd
+            continue
+        if typ == "response_item":
+            item = payload.get("item")
+            source = item if isinstance(item, dict) else payload
+            role = (source.get("role") or payload.get("role") or "").lower()
+            kind = (source.get("type") or payload.get("type") or "").lower()
+            if kind == "function_call":
+                summary = function_call_summary(source)
+                if summary:
+                    append_row(summary)
                 continue
-            typ = obj.get("type") or ""
-            payload = obj.get("payload") or {}
-            if typ == "session_meta":
-                title = payload.get("title") or title
-                cwd = payload.get("cwd") or cwd
+            text = item_text(source) or item_text(payload)
+            if not text:
                 continue
-            if typ == "response_item":
-                item = payload.get("item")
-                source = item if isinstance(item, dict) else payload
-                role = (source.get("role") or payload.get("role") or "").lower()
-                kind = (source.get("type") or payload.get("type") or "").lower()
-                text = item_text(source) or item_text(payload)
-                if not text:
-                    continue
-                if role == "user" or kind in ("user_message", "input_text"):
-                    clean_text = strip_hidden_prompt_context(text)
-                    if clean_text:
-                        append_row(f"› {clean_text}")
-                elif role == "assistant" or kind in ("assistant_message", "message"):
-                    clean_text = strip_hidden_prompt_context(text)
-                    if clean_text:
-                        append_row(clean_text)
-                else:
-                    clean_text = strip_hidden_prompt_context(text)
-                    if clean_text:
-                        append_row(clean_text)
-            elif typ == "event_msg":
-                message = text_from_content(payload.get("message") or payload)
-                if message:
-                    clean_message = strip_hidden_prompt_context(message)
-                    if clean_message:
-                        append_row(f"• {clean_message}")
+            if role == "user" or kind in ("user_message", "input_text"):
+                clean_text = strip_hidden_prompt_context(text)
+                if clean_text:
+                    latest_user_title = brief_user_title(clean_text) or latest_user_title
+                    append_row(f"› {clean_text}")
+            elif role == "assistant" or kind in ("assistant_message", "message"):
+                clean_text = strip_hidden_prompt_context(text)
+                if clean_text:
+                    append_row(f"• Codex\n{clean_text}")
+            else:
+                continue
+        elif typ == "event_msg":
+            event_type = str(payload.get("type") or "").lower()
+            if event_type in {"agent_message", "assistant_message", "message"}:
+                continue
+            message = text_from_content(payload.get("message") or payload)
+            if message:
+                clean_message = strip_hidden_prompt_context(message)
+                if clean_message:
+                    append_row(f"• {clean_message}")
 except Exception as exc:
     print(f"Codex history transcript read failed: {exc}", file=sys.stderr)
     sys.exit(66)
 
+def display_history_title(raw_title, raw_cwd):
+    value = str(raw_title or "").replace("\x00", "").strip()
+    cwd_value = str(raw_cwd or "").strip()
+    folder = pathlib.Path(cwd_value).name if cwd_value else ""
+    prefix = folder or "Codex"
+    for line in value.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = re.match(r"^Automation:\s*(.+)$", line, re.I)
+        if match:
+            return match.group(1).strip()[:160].strip()
+    thread_pattern = re.compile(r"(?i)\bcodex://threads/[0-9a-f-]{12,}\b")
+    if thread_pattern.search(value):
+        remainder = thread_pattern.sub("", value).replace("\n", " ").strip()
+        remainder = re.sub(r"\s+", " ", remainder)
+        if remainder:
+            return f"{prefix} - {remainder}"
+        return f"{prefix} 작업 맥락"
+    return value
+
 header = []
-if title:
-    header.append(f"Codex history: {title}")
+display_title = display_history_title(latest_user_title or title, cwd)
+if display_title:
+    header.append(f"Codex history: {display_title}")
+if latest_user_title and latest_user_title != display_title:
+    header.append(f"latest_user: {latest_user_title}")
 if cwd:
     header.append(f"directory: {cwd}")
 if session_id:
     header.append(f"codex_history_id: {session_id}")
+if transcript_truncated:
+    header.append(
+        f"transcript_window: last {max_tail_bytes // 1048576} MB of {transcript_size // 1048576} MB"
+    )
 if header:
     print("\n".join(header))
     print("")
@@ -5435,15 +6287,6 @@ show_status() {
   echo
   echo "tmux sessions:"
   tmux list-sessions 2>/dev/null || echo "none"
-  echo
-  echo "tailscale:"
-  if command -v tailscale >/dev/null 2>&1; then
-    tailscale status --self 2>/dev/null || tailscale status 2>/dev/null || echo "tailscale command failed"
-  elif [[ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]]; then
-    /Applications/Tailscale.app/Contents/MacOS/Tailscale status --self 2>/dev/null || /Applications/Tailscale.app/Contents/MacOS/Tailscale status 2>/dev/null || echo "tailscale command failed"
-  else
-    echo "tailscale CLI not found"
-  fi
 }
 
 show_plugins() {
@@ -6355,6 +7198,12 @@ case "${1:-status}" in
   permission-status)
     permission_status
     ;;
+  permission-status-quiet)
+    permission_status_quiet
+    ;;
+  permission-status-live)
+    permission_status_live
+    ;;
   permission-install)
     install_permission_host_app
     printf 'A-Cockpit Permission Host ready and preserved at: %s\n' "$PERMISSION_HOST_APP"
@@ -6541,6 +7390,9 @@ case "${1:-status}" in
   codex-history-sync-record)
     codex_sync_history_record "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}"
     ;;
+  codex-history-repair-index)
+    codex_history_repair_index
+    ;;
   codex-history-delete)
     codex_history_delete "${2:-}"
     ;;
@@ -6663,7 +7515,7 @@ case "${1:-status}" in
     show_plugins
     ;;
   *)
-    echo "usage: $0 {attach-shell|attach-codex|attach-monitor|send-codex|codex-queue-enqueue|codex-queue-enqueue-steer|codex-queue-enqueue-batch|codex-queue-promote-steer|codex-queue-reorder|codex-queue-cancel|codex-queue-start|codex-queue-resume-all|codex-queue-worker|codex-queue-status|codex-queue-job-status|codex-queue-recent|send-claude|steer-codex|steer-claude|codex-command|codex-token-status|codex-key|claude-key|restart-codex|restart-claude|ensure-codex-dir|resume-codex-latest-dir|resume-codex-session-dir|codex-history-json|codex-history-transcript|codex-history-sync-record|codex-history-delete|ensure-claude-dir|run-shell|shell-commit-line|shell-clear-line|shell-interrupt|shell-exit-codex|shell-key|shell-cd|capture-shell|capture-shell-pretty|capture-shell-console|capture-codex|capture-claude|capture-monitor|refresh-monitor|monitor-once|monitor-metric|tool-status|install-claude|permission-status|permission-install|permission-prep|permission-screenshot|permission-open-target|apple-signing-status|apple-signing-prep|apple-signing-test|codex-permission-prep|codex-cli-permission-status|codex-cli-permission-prep|tk-gui-test|gui-run-file|gui-run-status|computer-status|computer-screen|computer-snapshot|computer-click|computer-type|computer-key|codex-dev-setup|open-a-control-app|mobile-qa-gui|fan-status|fan-rpm|fan-mode|fan-apply|fan-app|network-speed|ensure-tailscale|list-dir|list-dir-tree|stat-file|resolve-file|mkdir-path|delete-path|read-file|read-file-preview|read-file-b64|tree-size|tar-dir|tar-gzip-dir|tar-gzip-dir-b64|tar-paths|zip-dir|zip-paths|write-file|install-uploaded-file|session-pwd|status|plugins}" >&2
+    echo "usage: $0 {attach-shell|attach-codex|attach-monitor|send-codex|codex-queue-enqueue|codex-queue-enqueue-steer|codex-queue-enqueue-batch|codex-queue-promote-steer|codex-queue-reorder|codex-queue-cancel|codex-queue-start|codex-queue-resume-all|codex-queue-worker|codex-queue-status|codex-queue-job-status|codex-queue-recent|send-claude|steer-codex|steer-claude|codex-command|codex-token-status|codex-key|claude-key|restart-codex|restart-claude|ensure-codex-dir|resume-codex-latest-dir|resume-codex-session-dir|codex-history-json|codex-history-status-json|codex-history-transcript|codex-history-sync-record|codex-history-repair-index|codex-history-delete|ensure-claude-dir|run-shell|shell-commit-line|shell-clear-line|shell-interrupt|shell-exit-codex|shell-key|shell-cd|capture-shell|capture-shell-pretty|capture-shell-console|capture-codex|capture-claude|capture-monitor|refresh-monitor|monitor-once|monitor-metric|tool-status|install-claude|permission-status|permission-status-quiet|permission-status-live|permission-install|permission-prep|permission-screenshot|permission-open-target|apple-signing-status|apple-signing-prep|apple-signing-test|codex-permission-prep|codex-cli-permission-status|codex-cli-permission-prep|tk-gui-test|gui-run-file|gui-run-status|computer-status|computer-screen|computer-snapshot|computer-click|computer-type|computer-key|codex-dev-setup|open-a-control-app|mobile-qa-gui|fan-status|fan-rpm|fan-mode|fan-apply|fan-app|network-speed|ensure-tailscale|list-dir|list-dir-tree|stat-file|resolve-file|mkdir-path|delete-path|read-file|read-file-preview|read-file-b64|tree-size|tar-dir|tar-gzip-dir|tar-gzip-dir-b64|tar-paths|zip-dir|zip-paths|write-file|install-uploaded-file|session-pwd|status|plugins}" >&2
     exit 2
     ;;
 esac

@@ -200,8 +200,10 @@ struct CodexView: View {
 
       HStack(alignment: .top, spacing: gap) {
         VStack(alignment: .leading, spacing: 12) {
-          SectionHeader(title: "A Codex", detail: short(model.currentRemoteDir)) {
-            await model.refreshCodexForVisibleSession()
+          HStack(alignment: .center, spacing: 10) {
+            SectionHeader(title: "A Codex", detail: short(model.currentRemoteDir)) {
+              await model.syncServerCodexHistoryAndRefreshVisibleSession()
+            }
           }
           if codexNeedsInstallGuide {
             CodexSetupNotice()
@@ -252,7 +254,7 @@ struct CodexView: View {
     }
     .animation(.spring(response: 0.22, dampingFraction: 0.88), value: model.isCodexFilePanelVisible)
     .task(id: model.activeSessionID) {
-      await model.refreshCodexForVisibleSession()
+      await model.syncServerCodexHistoryAndRefreshVisibleSession()
       while !Task.isCancelled {
         let activeWorking =
           model.activeSessionID.map { model.codexWorkingSessionIDs.contains($0) } ?? false
@@ -276,7 +278,7 @@ struct CodexView: View {
       }
     }
     .onAppear {
-      Task { await model.refreshCodexForVisibleSession() }
+      Task { await model.syncServerCodexHistoryAndRefreshVisibleSession() }
     }
   }
 
@@ -933,6 +935,7 @@ private struct CodexPromptPanel: View {
   @State private var selectedResearchPreset: CodexResearchPreset?
   @State private var activeControlPanel: CodexPromptControlPanel?
   @State private var selectedResearchGroupID: String?
+  @State private var draftSaveTask: Task<Void, Never>?
   @AppStorage("AControl.researchPresetLoopCount") private var storedResearchLoopCount =
     CodexResearchPreset.defaultLoopCount
   var codexModels: [CodexModelOption]
@@ -963,7 +966,7 @@ private struct CodexPromptPanel: View {
   }
 
   var body: some View {
-    GlassPanel(title: nil) {
+    VStack(alignment: .leading, spacing: 12) {
       VStack(alignment: .leading, spacing: 12) {
         if hasQueueItemsForActiveSession {
           CodexQueueStrip()
@@ -1072,6 +1075,8 @@ private struct CodexPromptPanel: View {
               onEscape: { Task { await model.codexKey("esc") } }
             )
 
+            steerSubmitButton
+
             PrimaryButton(
               title: "Send",
               symbol: "paperplane",
@@ -1123,8 +1128,12 @@ private struct CodexPromptPanel: View {
     }
     .onAppear {
       draft = model.codexDraftForActiveSession()
+      if model.codexPluginLog.trimmed.isEmpty {
+        Task { await model.checkCodexPlugins() }
+      }
     }
     .onChange(of: model.activeSessionID) { _, _ in
+      draftSaveTask?.cancel()
       draft = model.codexDraftForActiveSession()
       selectedResearchPreset = nil
       selectedResearchGroupID = nil
@@ -1132,8 +1141,58 @@ private struct CodexPromptPanel: View {
       activeControlPanel = nil
     }
     .onChange(of: draft) { _, newValue in
-      model.updateCodexDraftForActiveSession(newValue)
+      model.cacheCodexDraftForActiveSession(newValue)
+      draftSaveTask?.cancel()
+      let valueToPersist = newValue
+      draftSaveTask = Task { @MainActor in
+        try? await Task.sleep(nanoseconds: 450_000_000)
+        guard !Task.isCancelled else { return }
+        model.updateCodexDraftForActiveSession(valueToPersist)
+      }
     }
+    .onDisappear {
+      draftSaveTask?.cancel()
+      model.updateCodexDraftForActiveSession(draft)
+    }
+  }
+
+  private var steerSubmitButton: some View {
+    Button {
+      submit(steer: true)
+    } label: {
+      Label("Steer", systemImage: "arrow.triangle.turn.up.right.diamond")
+        .font(.system(size: 12.5, weight: .bold))
+        .lineLimit(1)
+        .padding(.horizontal, 12)
+        .frame(height: 34)
+    }
+    .buttonStyle(ImmediateFeedbackButtonStyle())
+    .disabled(!canSteerCodex)
+    .foregroundStyle(
+      canSteerCodex
+        ? AControlStyle.accentForeground(.blue, colorScheme)
+        : Color.secondary.opacity(0.55)
+    )
+    .background(
+      canSteerCodex
+        ? AnyShapeStyle(AControlStyle.accentFill(.blue, colorScheme))
+        : AnyShapeStyle(Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.035)),
+      in: Capsule()
+    )
+    .overlay {
+      Capsule()
+        .strokeBorder(
+          canSteerCodex
+            ? AControlStyle.accentStroke(.blue, colorScheme)
+            : AControlStyle.hairline(colorScheme),
+          lineWidth: 1
+        )
+    }
+    .safeHelp(
+      canSteerCodex
+        ? "Queue this as a steer follow-up on the server Codex"
+        : "Start or queue a Codex task first, then steer it"
+    )
   }
 
   private func submit(steer: Bool) {
@@ -1158,6 +1217,7 @@ private struct CodexPromptPanel: View {
         )
       }
       if accepted {
+        draftSaveTask?.cancel()
         draft = ""
         selectedResearchPreset = nil
         selectedResearchGroupID = nil
@@ -1221,6 +1281,8 @@ private struct CodexQueueStrip: View {
   @EnvironmentObject private var model: AppModel
   @Environment(\.colorScheme) private var colorScheme
   @State private var draggingQueueItemID: UUID?
+  @State private var editingQueueItemID: UUID?
+  @State private var editingQueueText = ""
 
   private var sessionItems: [CodexPromptQueueItem] {
     let active = model.activeSessionID
@@ -1308,6 +1370,29 @@ private struct CodexQueueStrip: View {
       RoundedRectangle(cornerRadius: 16, style: .continuous)
         .strokeBorder(AControlStyle.hairline(colorScheme), lineWidth: 1)
     }
+    .sheet(
+      isPresented: Binding(
+        get: { editingQueueItemID != nil },
+        set: { isPresented in
+          if !isPresented {
+            editingQueueItemID = nil
+          }
+        }
+      )
+    ) {
+      CodexQueueEditSheet(
+        text: $editingQueueText,
+        onCancel: {
+          editingQueueItemID = nil
+        },
+        onSave: {
+          guard let id = editingQueueItemID else { return }
+          let nextText = editingQueueText
+          editingQueueItemID = nil
+          Task { await model.editCodexQueueItem(id, text: nextText) }
+        }
+      )
+    }
   }
 
   private var queueHeaderTitle: String {
@@ -1333,7 +1418,12 @@ private struct CodexQueueStrip: View {
 
   @ViewBuilder
   private func queueRow(_ item: CodexPromptQueueItem) -> some View {
-    let row = CodexQueueChip(item: item, activeCodexIsWorking: activeCodexIsWorking)
+    let row = CodexQueueChip(
+      item: item,
+      activeCodexIsWorking: activeCodexIsWorking
+    ) { item in
+      beginEditing(item)
+    }
     if item.status == .queued || item.status == .waitingForCodex {
       row
         .onDrag {
@@ -1352,6 +1442,52 @@ private struct CodexQueueStrip: View {
     } else {
       row
     }
+  }
+
+  private func beginEditing(_ item: CodexPromptQueueItem) {
+    editingQueueText = item.visibleText
+    editingQueueItemID = item.id
+  }
+}
+
+private struct CodexQueueEditSheet: View {
+  @Environment(\.colorScheme) private var colorScheme
+  @Binding var text: String
+  var onCancel: () -> Void
+  var onSave: () -> Void
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 14) {
+      HStack {
+        Label("Edit Queue Item", systemImage: "pencil")
+          .font(.system(size: 14, weight: .bold))
+        Spacer()
+      }
+      TextEditor(text: $text)
+        .font(.system(size: 13, weight: .regular))
+        .scrollContentBackground(.hidden)
+        .padding(10)
+        .frame(width: 560, height: 220)
+        .background(
+          AControlStyle.transcriptFill(colorScheme),
+          in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
+        .overlay {
+          RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .strokeBorder(AControlStyle.hairline(colorScheme), lineWidth: 1)
+        }
+      HStack {
+        Spacer()
+        SoftButton(title: "Cancel", symbol: "xmark") {
+          onCancel()
+        }
+        PrimaryButton(title: "Save", symbol: "checkmark", tint: .blue, minWidth: 92) {
+          onSave()
+        }
+        .disabled(text.trimmed.isEmpty)
+      }
+    }
+    .padding(18)
   }
 }
 
@@ -1383,6 +1519,7 @@ private struct CodexQueueChip: View {
   @Environment(\.colorScheme) private var colorScheme
   var item: CodexPromptQueueItem
   var activeCodexIsWorking: Bool
+  var onEdit: (CodexPromptQueueItem) -> Void
 
   private var tint: Color {
     switch item.status {
@@ -1451,6 +1588,11 @@ private struct CodexQueueChip: View {
         if item.status == .failed {
           queueIconButton("arrow.clockwise", help: "Retry this prompt") {
             model.retryCodexQueueItem(item.id)
+          }
+        }
+        if item.status == .queued || item.status == .waitingForCodex || item.status == .failed {
+          queueIconButton("pencil", help: "Edit this queued prompt") {
+            onEdit(item)
           }
         }
         if item.status != .sending {
@@ -1937,7 +2079,7 @@ private struct CodexPromptControlSelectorPanel: View {
   private var combinedPluginSnippets: [CodexPluginSnippet] {
     var seen = Set<String>()
     var result: [CodexPluginSnippet] = []
-    for item in pluginSnippets + model.detectedCodexPluginSnippets {
+    for item in model.detectedCodexPluginSnippets + pluginSnippets {
       let key = item.title.lowercased()
       guard !seen.contains(key) else { continue }
       seen.insert(key)
@@ -2251,7 +2393,7 @@ private struct CodexPromptControls: View {
   private var combinedPluginSnippets: [CodexPluginSnippet] {
     var seen = Set<String>()
     var result: [CodexPluginSnippet] = []
-    for item in pluginSnippets + model.detectedCodexPluginSnippets {
+    for item in model.detectedCodexPluginSnippets + pluginSnippets {
       let key = item.title.lowercased()
       guard !seen.contains(key) else { continue }
       seen.insert(key)
@@ -2396,7 +2538,7 @@ struct CodexTranscriptCard: View {
   }
 
   var body: some View {
-    GlassPanel(title: nil) {
+    VStack(alignment: .leading, spacing: 10) {
       HStack(spacing: 8) {
         Image(systemName: symbol)
           .font(.system(size: 13, weight: .semibold))
@@ -2450,7 +2592,7 @@ struct CodexTranscriptCard: View {
             symbol: "arrow.clockwise",
             help: "Refresh transcript"
           ) {
-            Task { await model.refreshCodexForVisibleSession() }
+            Task { await model.syncServerCodexHistoryAndRefreshVisibleSession() }
           }
           if canUseTranscriptActions {
             transcriptHeaderButton(
@@ -2521,7 +2663,7 @@ struct CodexTranscriptCard: View {
         }
       }
       .onChange(of: text) { _, _ in
-        guard transcriptAtBottom || !userHasScrolledAway else { return }
+        guard transcriptAtBottom && !userHasScrolledAway else { return }
         userHasScrolledAway = false
         wheelScrollButtonFallback = false
         DispatchQueue.main.async {
@@ -2529,6 +2671,10 @@ struct CodexTranscriptCard: View {
         }
       }
       .onChange(of: scrollRequest) { _, _ in
+        guard transcriptAtBottom && !userHasScrolledAway else {
+          scrollButtonSuppressed = false
+          return
+        }
         suppressAwayReportsUntil = Date().addingTimeInterval(0.75)
         scrollButtonSuppressed = true
         userHasScrolledAway = false
@@ -2581,6 +2727,7 @@ struct CodexTranscriptCard: View {
         }
       }
     }
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
   }
 
   @ViewBuilder
@@ -2592,6 +2739,7 @@ struct CodexTranscriptCard: View {
         placeholder: placeholder,
         scrollSignal: scrollSignal,
         followTailSignal: followTailSignal,
+        userIsReadingHistory: userHasScrolledAway,
         onBottomStateChange: { visible, distance in
           transcriptAtBottom = visible
           transcriptDistanceToBottom = distance
@@ -2606,7 +2754,8 @@ struct CodexTranscriptCard: View {
           } else {
             wheelScrollButtonFallback = false
           }
-        }
+        },
+        usesPanelChrome: false
       )
     case .raw:
       TranscriptView(
@@ -2784,6 +2933,7 @@ struct CodexActivityTranscriptView: View {
   var placeholder: String
   var scrollSignal: Int
   var followTailSignal: Int
+  var userIsReadingHistory = false
   var onBottomStateChange: ((Bool, CGFloat) -> Void)?
   var usesPanelChrome = true
   @State private var isAtBottom = true
@@ -2848,13 +2998,17 @@ struct CodexActivityTranscriptView: View {
         .padding(.top, 18)
       }
       .coordinateSpace(name: "codexActivityTranscript")
-      .background(
-        transcriptBackground,
-        in: RoundedRectangle(cornerRadius: AControlStyle.insetRadius, style: .continuous)
-      )
+      .background {
+        if usesPanelChrome {
+          RoundedRectangle(cornerRadius: AControlStyle.insetRadius, style: .continuous)
+            .fill(AControlStyle.transcriptFill(colorScheme))
+        }
+      }
       .overlay {
-        RoundedRectangle(cornerRadius: AControlStyle.insetRadius, style: .continuous)
-          .strokeBorder(AControlStyle.hairline(colorScheme), lineWidth: usesPanelChrome ? 1 : 0)
+        if usesPanelChrome {
+          RoundedRectangle(cornerRadius: AControlStyle.insetRadius, style: .continuous)
+            .strokeBorder(AControlStyle.hairline(colorScheme), lineWidth: 1)
+        }
       }
       .accessibilityElement(children: .ignore)
       .accessibilityLabel(Text("Codex transcript"))
@@ -2876,47 +3030,16 @@ struct CodexActivityTranscriptView: View {
         y: usesPanelChrome ? 4 : 0
       )
       .onChange(of: scrollSignal) { _, _ in
-        proxy.scrollTo("codex-bottom", anchor: .bottom)
-        isAtBottom = true
-        onBottomStateChange?(true, 0)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-          proxy.scrollTo("codex-bottom", anchor: .bottom)
-          onBottomStateChange?(true, 0)
-        }
+        scrollToBottom(proxy, force: true, notify: true, extraDelays: [0.08])
       }
       .onChange(of: followTailSignal) { _, _ in
-        guard isAtBottom else { return }
         DispatchQueue.main.async {
-          proxy.scrollTo("codex-bottom", anchor: .bottom)
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            proxy.scrollTo("codex-bottom", anchor: .bottom)
-          }
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-            proxy.scrollTo("codex-bottom", anchor: .bottom)
-          }
-        }
-      }
-      .onChange(of: text) { _, _ in
-        guard isAtBottom else { return }
-        DispatchQueue.main.async {
-          proxy.scrollTo("codex-bottom", anchor: .bottom)
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            proxy.scrollTo("codex-bottom", anchor: .bottom)
-          }
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-            proxy.scrollTo("codex-bottom", anchor: .bottom)
-          }
+          scrollToBottom(proxy, force: false, extraDelays: [0.06])
         }
       }
       .onAppear {
         DispatchQueue.main.async {
-          proxy.scrollTo("codex-bottom", anchor: .bottom)
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            proxy.scrollTo("codex-bottom", anchor: .bottom)
-          }
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-            proxy.scrollTo("codex-bottom", anchor: .bottom)
-          }
+          scrollToBottom(proxy, force: true, extraDelays: [0.05, 0.18])
         }
       }
       .task(id: parseKey) {
@@ -2924,29 +3047,49 @@ struct CodexActivityTranscriptView: View {
         guard !Task.isCancelled else { return }
         let source = hasTranscriptText ? text : placeholder
         let isPlaceholder = !hasTranscriptText
-        let nextItems = await Task.detached(priority: .userInitiated) {
+        let parsed = await Task.detached(priority: .userInitiated) {
           CodexActivityParser.items(from: source, isPlaceholder: isPlaceholder)
         }.value
         guard !Task.isCancelled else { return }
-        let shouldKeepPinned = isAtBottom
+        let nextItems = parsed.enumerated().map { index, item in
+          item.withStableID(index: index)
+        }
+        let shouldKeepPinned = canFollowTail
         parsedItems = nextItems
         if shouldKeepPinned {
           DispatchQueue.main.async {
-            proxy.scrollTo("codex-bottom", anchor: .bottom)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-              proxy.scrollTo("codex-bottom", anchor: .bottom)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-              proxy.scrollTo("codex-bottom", anchor: .bottom)
-            }
+            scrollToBottom(proxy, force: false, extraDelays: [0.06])
           }
         }
       }
     }
   }
 
-  private var transcriptBackground: AnyShapeStyle {
-    usesPanelChrome ? AControlStyle.transcriptFill(colorScheme) : AnyShapeStyle(Color.clear)
+  private var canFollowTail: Bool {
+    !userIsReadingHistory && isAtBottom
+  }
+
+  private func scrollToBottom(
+    _ proxy: ScrollViewProxy,
+    force: Bool,
+    notify: Bool = false,
+    extraDelays: [TimeInterval] = []
+  ) {
+    guard force || canFollowTail else { return }
+    proxy.scrollTo("codex-bottom", anchor: .bottom)
+    if notify {
+      isAtBottom = true
+      onBottomStateChange?(true, 0)
+    }
+    for delay in extraDelays {
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+        guard force || canFollowTail else { return }
+        proxy.scrollTo("codex-bottom", anchor: .bottom)
+        if notify {
+          onBottomStateChange?(true, 0)
+        }
+      }
+    }
   }
 }
 
@@ -3112,8 +3255,10 @@ private struct CodexActivityRow: View {
 
   var body: some View {
     Group {
-      if item.kind == .prompt || item.kind == .steer {
+      if item.kind == .prompt {
         promptBubble
+      } else if item.kind.isTimelineEvent {
+        timelineEventLine
       } else {
         codexLine
       }
@@ -3189,11 +3334,48 @@ private struct CodexActivityRow: View {
       }
     }
     .overlay {
-      if item.kind == .working {
+      if item.kind == .working || item.kind == .goal {
         RoundedRectangle(cornerRadius: 14, style: .continuous)
           .strokeBorder(AControlStyle.accentStroke(.blue, colorScheme), lineWidth: 1)
       }
     }
+  }
+
+  private var timelineEventLine: some View {
+    HStack(alignment: .top, spacing: 11) {
+      Image(systemName: item.kind.symbol)
+        .font(.system(size: 12.5, weight: .semibold))
+        .foregroundStyle(.secondary.opacity(0.72))
+        .frame(width: 22, height: 22)
+
+      VStack(alignment: .leading, spacing: 6) {
+        Text(timelineEventTitle)
+          .font(.system(size: 13.2, weight: .medium))
+          .foregroundStyle(.secondary.opacity(0.82))
+          .lineLimit(2)
+          .fixedSize(horizontal: false, vertical: true)
+
+        if !timelineEventDetail.isEmpty {
+          ExpandableCodexTextWithInlineFiles(
+            expansionID: "\(item.id)-event-detail",
+            text: timelineEventDetail,
+            font: .system(size: 12.0, weight: .regular, design: item.kind.prefersMonospace ? .monospaced : .default),
+            color: .secondary.opacity(0.86),
+            collapsedLineLimit: item.kind.prefersMonospace ? 8 : 6,
+            fileReferences: item.fileReferences,
+            expandedTextIDs: $expandedTextIDs
+          ) { reference in
+            preview(reference, openingPanel: true)
+          } open: { reference in
+            preview(reference, openingPanel: true)
+          }
+        }
+
+        fileReferenceSection
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+    }
+    .padding(.vertical, item.kind == .steer ? 7 : 4)
   }
 
   @ViewBuilder
@@ -3246,38 +3428,57 @@ private struct CodexActivityRow: View {
           }
         }
       }
-      if !item.fileReferences.isEmpty && !hasInlineFileHeading {
-        HStack(spacing: 6) {
-          Image(systemName: "paperclip")
-            .font(.caption2.weight(.bold))
-          Text("Files")
-            .font(.caption2.weight(.bold))
-        }
-        .foregroundStyle(.secondary)
-        FlowLayout(spacing: 7) {
-          ForEach(item.fileReferences) { reference in
-            Button {
+      if !hasInlineFileHeading {
+        fileReferenceSection
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var fileReferenceSection: some View {
+    if !item.fileReferences.isEmpty {
+      let imageReferences = item.fileReferences.filter(\.isImage)
+      if !imageReferences.isEmpty {
+        VStack(alignment: .leading, spacing: 7) {
+          ForEach(imageReferences.prefix(4)) { reference in
+            CodexInlineImagePreview(reference: reference, context: fileReferenceContext) {
               preview(reference, openingPanel: true)
-            } label: {
-              CodexFileReferenceChip(reference: reference)
-            }
-            .buttonStyle(ImmediateFeedbackButtonStyle())
-            .safeHelp("Preview \(reference.path)")
-            .simultaneousGesture(
-              TapGesture(count: 2)
-                .onEnded {
-                  preview(reference, openingPanel: true)
-                }
-            )
-            .contextMenu {
-              Button("Open Preview Panel") {
-                preview(reference, openingPanel: true)
-              }
             }
           }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
       }
+
+      HStack(spacing: 6) {
+        Image(systemName: "paperclip")
+          .font(.caption2.weight(.bold))
+        Text("Files")
+          .font(.caption2.weight(.bold))
+      }
+      .foregroundStyle(.secondary)
+      FlowLayout(spacing: 7) {
+        ForEach(item.fileReferences) { reference in
+          Button {
+            preview(reference, openingPanel: true)
+          } label: {
+            CodexFileReferenceChip(reference: reference)
+          }
+          .buttonStyle(ImmediateFeedbackButtonStyle())
+          .safeHelp("Preview \(reference.path)")
+          .simultaneousGesture(
+            TapGesture(count: 2)
+              .onEnded {
+                preview(reference, openingPanel: true)
+              }
+          )
+          .contextMenu {
+            Button("Open Preview Panel") {
+              preview(reference, openingPanel: true)
+            }
+          }
+        }
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
     }
   }
 
@@ -3332,6 +3533,83 @@ private struct CodexActivityRow: View {
       .map(\.trimmed)
       .filter { !$0.isEmpty }
       .joined(separator: "\n")
+  }
+
+  private var fileReferenceContext: String {
+    [item.title, item.detail]
+      .map(\.trimmed)
+      .filter { !$0.isEmpty }
+      .joined(separator: "\n")
+  }
+
+  private var timelineEventTitle: String {
+    let raw: String
+    switch item.kind {
+    case .ran:
+      raw = "Ran \(strippingActivityPrefix(item.title, prefixes: ["Ran", "• Ran"]))"
+    case .explored:
+      raw = humanizedReadTitle(from: item.title)
+    case .edited:
+      raw = "Edited \(strippingActivityPrefix(item.title, prefixes: ["Edited", "• Edited"]))"
+    case .called:
+      raw = "Called \(strippingActivityPrefix(item.title, prefixes: ["Called", "• Called"]))"
+    case .waited:
+      raw = "Waited \(strippingActivityPrefix(item.title, prefixes: ["Waited", "• Waited"]))"
+    case .steer:
+      raw = "Steered conversation"
+    default:
+      raw = item.title
+    }
+    return raw
+      .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+      .trimmed
+  }
+
+  private var timelineEventDetail: String {
+    let value = item.kind == .steer ? narrativeText : item.detail
+    let trimmed = value.trimmed
+    if item.kind == .steer, trimmed.localizedCaseInsensitiveCompare("Steered conversation") == .orderedSame {
+      return ""
+    }
+    return trimmed
+  }
+
+  private func strippingActivityPrefix(_ value: String, prefixes: [String]) -> String {
+    var output = value.trimmed
+    for prefix in prefixes {
+      if output.hasPrefix(prefix) {
+        output = String(output.dropFirst(prefix.count)).trimmed
+      }
+    }
+    return output.isEmpty ? value.trimmed : output
+  }
+
+  private func humanizedReadTitle(from value: String) -> String {
+    let command = strippingActivityPrefix(value, prefixes: ["Explored", "• Explored"])
+    let lower = command.lowercased()
+    if lower.hasPrefix("sed ") || lower.hasPrefix("cat ") || lower.hasPrefix("tail ")
+      || lower.hasPrefix("head ")
+    {
+      return "Read \(bestPath(in: command) ?? command)"
+    }
+    if lower.hasPrefix("rg ") || lower.hasPrefix("grep ") {
+      return "Searched \(bestPath(in: command) ?? command)"
+    }
+    if lower.hasPrefix("ls ") || lower.hasPrefix("find ") {
+      return "Looked at \(bestPath(in: command) ?? command)"
+    }
+    return "Looked at \(command)"
+  }
+
+  private func bestPath(in command: String) -> String? {
+    let tokens = command
+      .split(separator: " ")
+      .map { String($0).trimmingCharacters(in: CharacterSet(charactersIn: "\"'")) }
+      .filter { !$0.isEmpty }
+    return tokens.last { token in
+      token.contains("/")
+        || token.range(of: #"\.[A-Za-z0-9]{1,8}$"#, options: .regularExpression) != nil
+    }
   }
 
   private var hasInlineFileHeading: Bool {
@@ -3605,12 +3883,20 @@ private struct CodexInlineFileMiniChip: View {
 }
 
 private struct CodexActivityItem: Identifiable, Sendable {
-  var id = UUID()
+  var id = ""
   var kind: CodexActivityKind
   var title: String
   var detail: String
   var badge: String?
   var fileReferences: [CodexInlineFileReference] = []
+
+  func withStableID(index: Int) -> CodexActivityItem {
+    var copy = self
+    let fileKey = fileReferences.map(\.path).joined(separator: "|")
+    let contentKey = "\(kind.roleLabel)|\(title)|\(detail)|\(badge ?? "")|\(fileKey)"
+    copy.id = "\(index)-\(contentKey.hashValue)"
+    return copy
+  }
 }
 
 private struct CodexInlineFileReference: Identifiable, Hashable, Sendable {
@@ -3633,6 +3919,63 @@ private struct CodexInlineFileReference: Identifiable, Hashable, Sendable {
       of: #"^/Users/[^/]+"#,
       with: "~",
       options: .regularExpression)
+  }
+
+  var isImage: Bool {
+    let ext = URL(fileURLWithPath: path).pathExtension.lowercased()
+    return ["png", "jpg", "jpeg", "webp", "gif", "heic", "tif", "tiff", "bmp"].contains(ext)
+  }
+}
+
+private struct CodexInlineImagePreview: View {
+  @EnvironmentObject private var model: AppModel
+  @Environment(\.colorScheme) private var colorScheme
+  var reference: CodexInlineFileReference
+  var context: String
+  var open: () -> Void
+  @State private var requested = false
+
+  private var previewURL: URL? {
+    model.codexInlineImagePreviewURLs[reference.path]
+  }
+
+  var body: some View {
+    Button(action: open) {
+      ZStack {
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
+          .fill(Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.045))
+        if let previewURL, let image = NSImage(contentsOf: previewURL) {
+          Image(nsImage: image)
+            .resizable()
+            .scaledToFit()
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        } else {
+          VStack(spacing: 7) {
+            ProgressView()
+              .controlSize(.small)
+            Text(reference.displayName)
+              .font(.caption.weight(.semibold))
+              .foregroundStyle(.secondary)
+              .lineLimit(1)
+              .truncationMode(.middle)
+          }
+          .padding(.horizontal, 12)
+        }
+      }
+      .frame(maxWidth: 430)
+      .frame(minHeight: 128, idealHeight: 180, maxHeight: 220)
+      .overlay {
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
+          .strokeBorder(AControlStyle.hairline(colorScheme), lineWidth: 1)
+      }
+    }
+    .buttonStyle(ImmediateFeedbackButtonStyle())
+    .safeHelp("Open \(reference.path)")
+    .task(id: reference.path) {
+      guard !requested else { return }
+      requested = true
+      await model.ensureCodexInlineImagePreview(for: reference.path, context: context)
+    }
   }
 }
 
@@ -3683,6 +4026,7 @@ private enum CodexActivityKind: Sendable, Equatable {
   case waited
   case steer
   case queued
+  case goal
   case working
   case result
   case placeholder
@@ -3697,6 +4041,7 @@ private enum CodexActivityKind: Sendable, Equatable {
     case .waited: "clock"
     case .steer: "arrow.triangle.turn.up.right.diamond"
     case .queued: "tray.and.arrow.down"
+    case .goal: "target"
     case .working: "progress.indicator"
     case .result: "sparkles"
     case .placeholder: "text.bubble"
@@ -3713,6 +4058,7 @@ private enum CodexActivityKind: Sendable, Equatable {
     case .waited: .gray
     case .steer: .purple
     case .queued: .orange
+    case .goal: .blue
     case .working: .blue
     case .result: .blue
     case .placeholder: .gray
@@ -3729,6 +4075,7 @@ private enum CodexActivityKind: Sendable, Equatable {
     case .waited: "Wait"
     case .steer: "Steer"
     case .queued: "Queued"
+    case .goal: "Goal"
     case .working: "Working"
     case .result: "Codex"
     case .placeholder: "Transcript"
@@ -3737,7 +4084,7 @@ private enum CodexActivityKind: Sendable, Equatable {
 
   var isPrimaryMessage: Bool {
     switch self {
-    case .prompt, .queued, .working:
+    case .prompt, .queued, .working, .goal:
       true
     default:
       false
@@ -3755,7 +4102,16 @@ private enum CodexActivityKind: Sendable, Equatable {
 
   var usesNarrativeStyle: Bool {
     switch self {
-    case .result, .placeholder, .steer:
+    case .result, .placeholder, .steer, .goal:
+      true
+    default:
+      false
+    }
+  }
+
+  var isTimelineEvent: Bool {
+    switch self {
+    case .ran, .explored, .edited, .called, .waited, .steer:
       true
     default:
       false
@@ -3958,6 +4314,7 @@ private enum CodexActivityParser {
       || line.hasPrefix("Queued") || line.hasPrefix("• Queued")
       || line.hasPrefix("─ Worked") || line.hasPrefix("Steered conversation")
       || line.hasPrefix("Working (") || line.hasPrefix("Thinking")
+      || line.hasPrefix("Pursuing goal") || line.hasPrefix("Goal:")
       || isPatchHeaderLine(line)
       || looksLikeToolOutputLine(line)
   }
@@ -4103,6 +4460,19 @@ private enum CodexActivityParser {
         .replacingOccurrences(of: "Queued", with: "Queued for Codex")
       return CodexActivityItem(
         kind: .queued, title: title, detail: detail, badge: "Queue",
+        fileReferences: groupFileReferences)
+    }
+    if effectiveFirst.hasPrefix("Pursuing goal") || effectiveFirst.hasPrefix("Goal:") {
+      let title =
+        effectiveFirst
+        .replacingOccurrences(of: "Pursuing goal", with: "Pursuing goal")
+        .replacingOccurrences(of: #"^Goal:\s*"#, with: "Pursuing goal ", options: .regularExpression)
+        .trimmed
+      return CodexActivityItem(
+        kind: .goal,
+        title: title.isEmpty ? "Pursuing goal" : title,
+        detail: detail,
+        badge: "Goal",
         fileReferences: groupFileReferences)
     }
     if effectiveFirst.hasPrefix("• Working") || effectiveFirst.hasPrefix("Working (")
@@ -4455,7 +4825,7 @@ private enum CodexActivityParser {
     let previousText = normalizedContent([previous.title, previous.detail].joined(separator: " "))
     guard !currentText.isEmpty, currentText == previousText else { return false }
     switch item.kind {
-    case .waited, .working, .ran, .explored, .edited, .called, .result:
+    case .waited, .working, .ran, .explored, .edited, .called, .goal, .result:
       return true
     case .prompt, .steer, .queued, .placeholder:
       return false

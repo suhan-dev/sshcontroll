@@ -534,7 +534,7 @@ struct CodeWorkspaceView: View {
         .safeHelp("Scroll Codex to bottom")
         Button {
           Task {
-            await model.refreshCodexForVisibleSession()
+            await model.syncServerCodexHistoryAndRefreshVisibleSession()
             codexScrollSignal += 1
           }
         } label: {
@@ -874,6 +874,8 @@ private struct CodeWorkspaceQueueStrip: View {
   @EnvironmentObject private var model: AppModel
   @Environment(\.colorScheme) private var colorScheme
   var items: [CodexPromptQueueItem]
+  @State private var editingQueueItemID: UUID?
+  @State private var editingQueueText = ""
 
   private var palette: CodeWorkspacePalette {
     CodeWorkspacePalette(scheme: colorScheme)
@@ -908,7 +910,13 @@ private struct CodeWorkspaceQueueStrip: View {
       .frame(height: 28)
 
       ForEach(items.prefix(4)) { item in
-        CodeWorkspaceQueueRow(item: item, activeCodexIsWorking: activeCodexIsWorking)
+        CodeWorkspaceQueueRow(
+          item: item,
+          activeCodexIsWorking: activeCodexIsWorking
+        ) { item in
+          editingQueueText = item.visibleText
+          editingQueueItemID = item.id
+        }
           .environmentObject(model)
       }
     }
@@ -916,6 +924,29 @@ private struct CodeWorkspaceQueueStrip: View {
     .overlay {
       RoundedRectangle(cornerRadius: 7)
         .strokeBorder(palette.secondaryText.opacity(0.10), lineWidth: 1)
+    }
+    .sheet(
+      isPresented: Binding(
+        get: { editingQueueItemID != nil },
+        set: { isPresented in
+          if !isPresented {
+            editingQueueItemID = nil
+          }
+        }
+      )
+    ) {
+      CodeWorkspaceQueueEditSheet(
+        text: $editingQueueText,
+        onCancel: {
+          editingQueueItemID = nil
+        },
+        onSave: {
+          guard let id = editingQueueItemID else { return }
+          let nextText = editingQueueText
+          editingQueueItemID = nil
+          Task { await model.editCodexQueueItem(id, text: nextText) }
+        }
+      )
     }
   }
 }
@@ -925,6 +956,7 @@ private struct CodeWorkspaceQueueRow: View {
   @Environment(\.colorScheme) private var colorScheme
   var item: CodexPromptQueueItem
   var activeCodexIsWorking: Bool
+  var onEdit: (CodexPromptQueueItem) -> Void
 
   private var palette: CodeWorkspacePalette {
     CodeWorkspacePalette(scheme: colorScheme)
@@ -955,6 +987,11 @@ private struct CodeWorkspaceQueueRow: View {
       if item.status == .failed {
         queueButton("arrow.clockwise", help: "Retry") {
           model.retryCodexQueueItem(item.id)
+        }
+      }
+      if item.status == .queued || item.status == .waitingForCodex || item.status == .failed {
+        queueButton("pencil", help: "Edit") {
+          onEdit(item)
         }
       }
       if item.status != .sending {
@@ -1004,6 +1041,36 @@ private struct CodeWorkspaceQueueRow: View {
     .buttonStyle(ImmediateFeedbackButtonStyle())
     .foregroundStyle(palette.secondaryText)
     .safeHelp(help)
+  }
+}
+
+private struct CodeWorkspaceQueueEditSheet: View {
+  @Environment(\.colorScheme) private var colorScheme
+  @Binding var text: String
+  var onCancel: () -> Void
+  var onSave: () -> Void
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 14) {
+      Label("Edit Queue Item", systemImage: "pencil")
+        .font(.system(size: 14, weight: .bold))
+      TextEditor(text: $text)
+        .font(.system(size: 13))
+        .scrollContentBackground(.hidden)
+        .padding(10)
+        .frame(width: 560, height: 220)
+        .background(
+          Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.04),
+          in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
+      HStack {
+        Spacer()
+        Button("Cancel", action: onCancel)
+        Button("Save", action: onSave)
+          .disabled(text.trimmed.isEmpty)
+      }
+    }
+    .padding(18)
   }
 }
 
@@ -1401,16 +1468,16 @@ private struct CodeWorkspacePalette {
   var scheme: ColorScheme
 
   var isDark: Bool { scheme == .dark }
-  var background: Color { isDark ? Color(red: 0.075, green: 0.078, blue: 0.082) : Color(red: 0.970, green: 0.974, blue: 0.980) }
-  var titleBar: Color { isDark ? Color(red: 0.095, green: 0.098, blue: 0.102) : Color(red: 0.920, green: 0.930, blue: 0.944) }
-  var tabBar: Color { isDark ? Color(red: 0.082, green: 0.085, blue: 0.089) : Color(red: 0.940, green: 0.948, blue: 0.960) }
-  var sidebar: Color { isDark ? Color(red: 0.075, green: 0.078, blue: 0.082) : Color(red: 0.945, green: 0.952, blue: 0.963) }
-  var header: Color { isDark ? Color(red: 0.085, green: 0.088, blue: 0.092) : Color(red: 0.955, green: 0.962, blue: 0.972) }
-  var panel: Color { isDark ? Color(red: 0.070, green: 0.073, blue: 0.077) : Color(red: 0.955, green: 0.962, blue: 0.972) }
-  var console: Color { isDark ? Color(red: 0.060, green: 0.063, blue: 0.067) : Color(red: 0.900, green: 0.910, blue: 0.925) }
-  var statusBar: Color { isDark ? Color(red: 0.065, green: 0.068, blue: 0.072) : Color(red: 0.930, green: 0.940, blue: 0.953) }
-  var controlFill: Color { isDark ? Color.white.opacity(0.075) : Color.black.opacity(0.065) }
-  var selectionFill: Color { isDark ? Color.white.opacity(0.115) : Color.blue.opacity(0.12) }
+  var background: Color { isDark ? Color(red: 0.128, green: 0.136, blue: 0.150) : Color(red: 0.970, green: 0.974, blue: 0.980) }
+  var titleBar: Color { isDark ? Color(red: 0.156, green: 0.164, blue: 0.180) : Color(red: 0.920, green: 0.930, blue: 0.944) }
+  var tabBar: Color { isDark ? Color(red: 0.143, green: 0.151, blue: 0.166) : Color(red: 0.940, green: 0.948, blue: 0.960) }
+  var sidebar: Color { isDark ? Color(red: 0.132, green: 0.141, blue: 0.157) : Color(red: 0.945, green: 0.952, blue: 0.963) }
+  var header: Color { isDark ? Color(red: 0.150, green: 0.158, blue: 0.174) : Color(red: 0.955, green: 0.962, blue: 0.972) }
+  var panel: Color { isDark ? Color(red: 0.138, green: 0.146, blue: 0.162) : Color(red: 0.955, green: 0.962, blue: 0.972) }
+  var console: Color { isDark ? Color(red: 0.118, green: 0.126, blue: 0.140) : Color(red: 0.900, green: 0.910, blue: 0.925) }
+  var statusBar: Color { isDark ? Color(red: 0.135, green: 0.143, blue: 0.158) : Color(red: 0.930, green: 0.940, blue: 0.953) }
+  var controlFill: Color { isDark ? Color.white.opacity(0.115) : Color.black.opacity(0.065) }
+  var selectionFill: Color { isDark ? Color.white.opacity(0.150) : Color.blue.opacity(0.12) }
   var primaryText: Color { isDark ? Color.white.opacity(0.90) : Color.black.opacity(0.82) }
   var secondaryText: Color { isDark ? Color.white.opacity(0.62) : Color.black.opacity(0.52) }
 }

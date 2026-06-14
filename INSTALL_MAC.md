@@ -140,8 +140,8 @@ Scripts/package-macos.sh
 Generated files:
 
 ```text
-dist/SSHcontroll-0.2.0-macOS.pkg
-dist/SSHcontroll-0.2.0-macOS.zip
+dist/SSHcontroll-0.2.1-macOS.pkg
+dist/SSHcontroll-0.2.1-macOS.zip
 dist/SHA256SUMS.txt
 ```
 
@@ -149,6 +149,6 @@ Verify the generated release:
 
 ```bash
 (cd dist && shasum -a 256 -c SHA256SUMS.txt)
-pkgutil --payload-files dist/SSHcontroll-0.2.0-macOS.pkg | head
-unzip -l dist/SSHcontroll-0.2.0-macOS.zip | head
+pkgutil --payload-files dist/SSHcontroll-0.2.1-macOS.pkg | head
+unzip -l dist/SSHcontroll-0.2.1-macOS.zip | head
 ```

@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 CONFIG="${SSHCONTROLL_CONFIG:-${ACONTROL_CONFIG:-release}}"
-VERSION="${SSHCONTROLL_VERSION:-${ACONTROL_VERSION:-0.2.0}}"
+VERSION="${SSHCONTROLL_VERSION:-${ACONTROL_VERSION:-0.2.1}}"
 BUILD_NUMBER="${SSHCONTROLL_BUILD_NUMBER:-1}"
 BUNDLE_IDENTIFIER="${SSHCONTROLL_BUNDLE_IDENTIFIER:-dev.suhan.sshcontroll}"
 APP_NAME="${SSHCONTROLL_APP_NAME:-SSHcontroll}"
@@ -34,7 +34,7 @@ Usage: Scripts/build-app.sh [--debug|--release] [--no-install] [--open]
 By default this builds an optimized app and installs it to ~/Desktop/SSHcontroll.app.
 
 Environment:
-  SSHCONTROLL_VERSION=0.2.0
+  SSHCONTROLL_VERSION=0.2.1
   SSHCONTROLL_BUILD_NUMBER=1
   SSHCONTROLL_BUNDLE_IDENTIFIER=dev.suhan.sshcontroll
   SSHCONTROLL_EXECUTABLE_NAME=SSHcontroll

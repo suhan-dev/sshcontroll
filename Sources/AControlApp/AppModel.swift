@@ -18,6 +18,8 @@ private struct CodexAQueueBatchJob: Encodable {
   var order: String
   var historyID: String
   var directory: String
+  var forceNew: Bool = false
+  var excludeHistoryIDs: [String] = []
 }
 
 @MainActor
@@ -70,6 +72,8 @@ final class AppModel: ObservableObject {
   @Published var monitorMetricInFlight: String?
   @Published var shellInput = ""
   @Published var shellCompletions: [ShellCompletion] = []
+  @Published var activeFileTransfer: FileTransferProgress?
+  @Published var fileTransferLogEntries: [String] = []
   @Published var codexInput = ""
   @Published var codexModel = "gpt-5.5"
   @Published var codexReasoningEffort = "xhigh"
@@ -91,6 +95,7 @@ final class AppModel: ObservableObject {
   @Published var codexPreviewArtifact: CodexArtifact?
   @Published var codexArtifactPreviewText = ""
   @Published var codexArtifactPreviewURL: URL?
+  @Published var codexInlineImagePreviewURLs: [String: URL] = [:]
   @Published var codexArtifactPreviewKind: RemotePreviewKind = .none
   @Published var isCodexArtifactPreviewLoading = false
   @Published var codexArtifactPreviewError = ""
@@ -142,6 +147,7 @@ final class AppModel: ObservableObject {
   private let maxEditableRemoteTextBytes: Int64 = 2_500_000
   private let maxTextPreviewBytes = 260_000
   private let maxBackgroundPreviewDownloadBytes: Int64 = 1_500_000
+  private let maxInlineImagePreviewDownloadBytes: Int64 = 12_000_000
   private let largeRemoteTextSaveThreshold = 1_500_000
   private var remotePreviewRequestID = UUID()
   private var codexTranscriptAutoRefreshDeadline: Date?
@@ -364,6 +370,7 @@ final class AppModel: ObservableObject {
     persistCodexPromptQueue()
 
     sanitizeCodexRuntimeSelection()
+    pruneLocalCodexHistorySessions(save: true)
     pruneNoisyImportedCodexSessions(save: true)
     sanitizeImportedCodexSessionNames(save: true)
     if collapseDuplicateCodexHistorySessions() {
@@ -375,10 +382,26 @@ final class AppModel: ObservableObject {
     if normalizedSettings != loadedSettings {
       saveSettings()
     }
+    scheduleInitialServerCodexHistorySyncIfNeeded()
   }
 
   var activeSession: SessionCard? {
     sessions.first(where: { $0.id == activeSessionID })
+  }
+
+  private func scheduleInitialServerCodexHistorySyncIfNeeded() {
+    guard sessions.isEmpty, settings.hasSSHTarget else { return }
+    Task { [weak self] in
+      try? await Task.sleep(nanoseconds: 700_000_000)
+      guard let self, self.sessions.isEmpty else { return }
+      await self.syncCodexAppSessions(
+        showsActivity: false,
+        refreshWorkingAfter: false,
+        allowNewImports: true,
+        onlyCurrentDirectory: false,
+        includeAllDirectories: true
+      )
+    }
   }
 
   private func sessionSnapshot(for id: UUID?) -> SessionCard? {
@@ -418,7 +441,7 @@ final class AppModel: ObservableObject {
         snippet: pluginPromptMention(for: pluginID),
         category: "Installed",
         symbol: "puzzlepiece.extension",
-        detail: "Detected installed Codex plugin"
+        detail: "Available on the server Codex"
       )
     }
   }
@@ -548,11 +571,14 @@ final class AppModel: ObservableObject {
       clearCodexDerivedState()
       return
     }
-    if activeSession?.codexState == .fresh, activeSession?.codexHistoryID.trimmed.isEmpty != false {
+    let cachedCodex = cachedTranscript(for: .codex)
+    if activeSession?.codexState == .fresh, activeSession?.codexHistoryID.trimmed.isEmpty != false,
+      cachedCodex.trimmed.isEmpty
+    {
       setCodexTranscript("", force: true)
       clearCodexDerivedState()
     } else {
-      setCodexTranscript(cachedTranscript(for: .codex), force: true)
+      setCodexTranscript(cachedCodex, force: true)
     }
     setClaudeTranscript(cachedTranscript(for: .claude), force: true)
     scheduleCodexTranscriptAnalysis(force: true)
@@ -679,12 +705,11 @@ final class AppModel: ObservableObject {
 
   private func codexTranscriptPreservingLocalTurns(_ incoming: String) -> String {
     guard let sessionID = activeSessionID else { return incoming }
-    let hasUndeliveredLocalSteer = codexPromptQueue.contains { item in
+    let hasUndeliveredLocalTurn = codexPromptQueue.contains { item in
       item.sessionID == sessionID
-        && item.kind == .steer
         && (item.status == .queued || item.status == .sending || item.status == .waitingForCodex)
     }
-    guard hasUndeliveredLocalSteer else {
+    guard hasUndeliveredLocalTurn else {
       pendingCodexLocalTurnBlocksBySession.removeValue(forKey: sessionID)
       codexDeliveredQueueBlocksBySession.removeValue(forKey: sessionID)
       return incoming
@@ -770,6 +795,24 @@ final class AppModel: ObservableObject {
     return output
   }
 
+  private func codexTranscriptKeepingStableCache(_ incoming: String) -> String {
+    let current = codexTranscript.trimmed
+    let next = incoming.trimmed
+    guard !current.isEmpty, !next.isEmpty else { return incoming }
+    guard next.count < current.count else { return incoming }
+    if current == next { return current }
+    if current.hasPrefix(next), current.count - next.count > 600 {
+      return current
+    }
+    let shortEnoughToBeCaptureFragment =
+      Double(next.count) < Double(current.count) * 0.68
+        && current.count - next.count > 1_200
+    if shortEnoughToBeCaptureFragment && normalizedCodexTurnText(current).contains(normalizedCodexTurnText(next)) {
+      return current
+    }
+    return incoming
+  }
+
   private func applyCodexTranscriptResult(_ result: CommandResult, replaceOnFailure: Bool = false) {
     codexTranscriptCheckedAt = Date()
     if result.exitCode != 0, isCodexControlError(result.combined) {
@@ -779,7 +822,8 @@ final class AppModel: ObservableObject {
     }
     var transcriptChanged = false
     if result.exitCode == 0 {
-      let mergedInput = codexTranscriptPreservingLocalTurns(result.combined)
+      let stableInput = codexTranscriptKeepingStableCache(result.combined)
+      let mergedInput = codexTranscriptPreservingLocalTurns(stableInput)
       let merged = persistTranscript(.codex, value: mergedInput)
       transcriptChanged = setCodexTranscript(merged)
     } else if replaceOnFailure || codexTranscript.trimmed.isEmpty {
@@ -1249,7 +1293,47 @@ final class AppModel: ObservableObject {
     statusText = "Removed Codex queue item · \(Date().shortStamp)"
   }
 
-  private func cancelAQueuedCodexItem(remoteQueueID: String, sessionID: UUID?) async {
+  func editCodexQueueItem(_ id: UUID, text: String) async {
+    let replacement = text.trimmed
+    guard !replacement.isEmpty else {
+      statusText = "Queue item cannot be empty · \(Date().shortStamp)"
+      return
+    }
+    guard let item = codexPromptQueue.first(where: { $0.id == id }) else { return }
+    guard item.status != .sending else {
+      statusText = "Cannot edit while prompt is sending · \(Date().shortStamp)"
+      return
+    }
+    guard item.status != .delivered else { return }
+    if item.status == .waitingForCodex,
+      let remoteQueueID = item.remoteQueueID?.trimmed,
+      !remoteQueueID.isEmpty
+    {
+      let cancelled = await cancelAQueuedCodexItem(
+        remoteQueueID: remoteQueueID,
+        sessionID: item.sessionID
+      )
+      guard cancelled else {
+        statusText = "A queue item is already processing · \(Date().shortStamp)"
+        return
+      }
+    }
+    guard let index = codexPromptQueue.firstIndex(where: { $0.id == id }) else { return }
+    var items = codexPromptQueue
+    items[index].text = replacement
+    items[index].displayText = replacement
+    items[index].status = .queued
+    items[index].remoteQueueID = nil
+    items[index].lastError = ""
+    items[index].updatedAt = Date()
+    codexPromptQueue = items
+    statusText = "Queued prompt edited · \(Date().shortStamp)"
+    scheduleCodexTranscriptAnalysis(force: true)
+    processCodexPromptQueue()
+  }
+
+  @discardableResult
+  private func cancelAQueuedCodexItem(remoteQueueID: String, sessionID: UUID?) async -> Bool {
     let environment = remoteEnvironment(for: sessionSnapshot(for: sessionID))
     let result = await runRemote(
       "codex-queue-cancel",
@@ -1261,7 +1345,9 @@ final class AppModel: ObservableObject {
     )
     if result.exitCode != 0 {
       lastMirrorLog = result.combined
+      return false
     }
+    return true
   }
 
   func retryCodexQueueItem(_ id: UUID) {
@@ -1306,7 +1392,19 @@ final class AppModel: ObservableObject {
   }
 
   func refreshCodexForVisibleSession() async {
-    await syncCodexAppSessions(allowNewImports: true, onlyCurrentDirectory: true)
+    let shouldImportAllServerHistory = sessions.isEmpty
+    await syncCodexAppSessions(
+      allowNewImports: true,
+      onlyCurrentDirectory: !shouldImportAllServerHistory,
+      includeAllDirectories: shouldImportAllServerHistory
+    )
+    await refreshCodexPromptQueueStatuses()
+    await captureCodexIfUseful(force: true)
+  }
+
+  func syncServerCodexHistoryAndRefreshVisibleSession() async {
+    await importAllCodexHistorySessions()
+    await refreshCodexWorkingStates(force: true)
     await refreshCodexPromptQueueStatuses()
     await captureCodexIfUseful(force: true)
   }
@@ -1455,6 +1553,11 @@ final class AppModel: ObservableObject {
     let draft = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     codexDraftsBySession[activeSessionID] = draft
     return draft
+  }
+
+  func cacheCodexDraftForActiveSession(_ value: String) {
+    guard let activeSessionID else { return }
+    codexDraftsBySession[activeSessionID] = value
   }
 
   func updateCodexDraftForActiveSession(_ value: String) {
@@ -1956,6 +2059,27 @@ final class AppModel: ObservableObject {
     }
   }
 
+  func selectConnectionNetworkProfile(_ profile: ConnectionNetworkProfile) {
+    let previous = settings.selectedNetworkProfile
+    if previous != profile {
+      settings.storeConnection(
+        hostAlias: settings.hostAlias,
+        sshPort: settings.sshPort,
+        latencyTarget: settings.latencyTarget,
+        in: previous
+      )
+    }
+    settings.applyNetworkProfile(profile)
+    saveSettings()
+    statusText = "Connection profile: \(profile.title) · \(Date().shortStamp)"
+  }
+
+  func saveCurrentConnectionToSelectedProfile() {
+    settings.storeActiveConnectionInSelectedProfile()
+    saveSettings()
+    statusText = "Saved \(settings.selectedNetworkProfile.title) connection · \(Date().shortStamp)"
+  }
+
   func selectSurface(_ surface: AppSurface) {
     selectedSurface = surface
     isCodeWorkspaceInlineActive = false
@@ -2154,8 +2278,7 @@ final class AppModel: ObservableObject {
     case .shell:
       await captureShell()
     case .codex:
-      await refreshCodexWorkingStates(force: true)
-      await captureCodexIfUseful(force: true)
+      await syncServerCodexHistoryAndRefreshVisibleSession()
     case .claude:
       await captureClaude()
     case .files:
@@ -2469,7 +2592,7 @@ final class AppModel: ObservableObject {
     }
 
     if selectedSurface == .codex {
-      await refreshCodexForVisibleSession()
+      await syncServerCodexHistoryAndRefreshVisibleSession()
     } else if selectedSurface == .claude, activeClaudeConversationIsEstablished {
       await captureClaude()
     }
@@ -3064,41 +3187,54 @@ final class AppModel: ObservableObject {
     return 1.60
   }
 
-  func refreshCodexHistory(force: Bool = false, showsActivity: Bool? = nil) async {
+  func refreshCodexHistory(
+    force: Bool = false,
+    showsActivity: Bool? = nil,
+    includeAllDirectories: Bool = false
+  ) async {
     if !force, let lastCodexHistoryRefresh,
       lastCodexHistoryRefreshDirectory == normalizedRemotePath(currentRemoteDir),
+      !includeAllDirectories,
       Date().timeIntervalSince(lastCodexHistoryRefresh) < 8
     {
       return
     }
-    lastCodexHistoryRefresh = Date()
-    lastCodexHistoryRefreshDirectory = normalizedRemotePath(currentRemoteDir)
+    if !includeAllDirectories {
+      lastCodexHistoryRefresh = Date()
+      lastCodexHistoryRefreshDirectory = normalizedRemotePath(currentRemoteDir)
+    }
+    var remoteEnvironment = [
+      "A_COCKPIT_CODEX_HISTORY_HOST": "remote"
+    ]
+    if force {
+      remoteEnvironment["A_COCKPIT_CODEX_HISTORY_FORCE"] = "1"
+    }
+    if includeAllDirectories {
+      remoteEnvironment["A_COCKPIT_CODEX_HISTORY_FORCE"] = "1"
+      remoteEnvironment["A_COCKPIT_CODEX_HISTORY_SCOPE"] = "all"
+    }
     let remoteResult = await runRemote(
       "codex-history-json", input: currentRemoteDir + "\n", timeout: 30,
       showsActivity: showsActivity ?? false,
-      environmentOverride: force
-        ? [
-          "A_COCKPIT_CODEX_HISTORY_FORCE": "1",
-          "A_COCKPIT_CODEX_HISTORY_HOST": "remote",
-        ]
-        : ["A_COCKPIT_CODEX_HISTORY_HOST": "remote"])
-    async let localResult = runLocalHelper(
-      "codex-history-json",
-      input: currentRemoteDir + "\n",
-      timeout: 24,
-      environment: [
-        "A_COCKPIT_CODEX_HISTORY_FORCE": "1",
-        "A_COCKPIT_CODEX_HISTORY_HOST": "local",
-      ]
-    )
-    var records = decodedCodexHistoryRecords(from: remoteResult, host: "remote")
-    records.append(contentsOf: decodedCodexHistoryRecords(from: await localResult, host: "local"))
+      environmentOverride: remoteEnvironment)
+    let prunedLocalSessions = pruneLocalCodexHistorySessions(save: false)
+    let records = decodedCodexHistoryRecords(from: remoteResult, host: "remote").filter {
+      $0.normalizedHost == "remote"
+    }
     let visibleRecords = mergedCodexHistoryRecords(records).filter {
       !isCodexHistoryTombstoned($0.id) && !$0.isSubagent
     }
-    guard !visibleRecords.isEmpty || remoteResult.exitCode == 0 else { return }
+    guard !visibleRecords.isEmpty || remoteResult.exitCode == 0 else {
+      if prunedLocalSessions {
+        saveSessions()
+      }
+      return
+    }
     codexHistoryRecords = visibleRecords
     reconcileExistingCodexHistorySessions(with: visibleRecords)
+    if prunedLocalSessions {
+      saveSessions()
+    }
     var activeRecord: CodexHistoryRecord?
     let activeHistoryHost = activeSession?.codexHistoryHost.trimmed.lowercased().nilIfEmpty ?? "remote"
     if let activeID = activeSession?.codexHistoryID.trimmed, !activeID.isEmpty,
@@ -3263,6 +3399,42 @@ final class AppModel: ObservableObject {
   }
 
   @discardableResult
+  private func pruneLocalCodexHistorySessions(save shouldSave: Bool) -> Bool {
+    var removeIDs = Set<UUID>()
+    for session in sessions {
+      let historyID = session.codexHistoryID.trimmed
+      let host = session.codexHistoryHost.trimmed.lowercased()
+      guard !historyID.isEmpty, host == "local" else { continue }
+      removeIDs.insert(session.id)
+    }
+    guard !removeIDs.isEmpty else { return false }
+
+    sessions.removeAll { removeIDs.contains($0.id) }
+    codexPromptQueue.removeAll { item in
+      guard let sessionID = item.sessionID else { return false }
+      return removeIDs.contains(sessionID)
+    }
+    for removedID in removeIDs {
+      try? FileManager.default.removeItem(at: sessionDirectory(for: removedID.uuidString))
+    }
+    codexWorkingSessionIDs.subtract(removeIDs)
+    claudeWorkingSessionIDs.subtract(removeIDs)
+    workingSessionIDs.subtract(removeIDs)
+    if let activeSessionID, removeIDs.contains(activeSessionID) {
+      self.activeSessionID = sessions.first?.id
+      if let activeSession {
+        currentRemoteDir = activeSession.remoteDir
+        loadCachedTranscriptsForActiveSession()
+      }
+    }
+    saveWorkingSessionIDs()
+    if shouldSave {
+      saveSessions()
+    }
+    return true
+  }
+
+  @discardableResult
   private func pruneNoisyImportedCodexSessions(save shouldSave: Bool) -> Bool {
     let userDirectories = Set(
       sessions
@@ -3358,14 +3530,27 @@ final class AppModel: ObservableObject {
     await syncCodexAppSessions(allowNewImports: true, onlyCurrentDirectory: true)
   }
 
+  func importAllCodexHistorySessions() async {
+    await syncCodexAppSessions(
+      allowNewImports: true,
+      onlyCurrentDirectory: false,
+      includeAllDirectories: true
+    )
+  }
+
   func syncCodexAppSessions(
     showsActivity: Bool = true,
     force: Bool = true,
     refreshWorkingAfter: Bool = true,
     allowNewImports: Bool = false,
-    onlyCurrentDirectory: Bool = false
+    onlyCurrentDirectory: Bool = false,
+    includeAllDirectories: Bool = false
   ) async {
-    await refreshCodexHistory(force: force, showsActivity: showsActivity)
+    await refreshCodexHistory(
+      force: force,
+      showsActivity: showsActivity,
+      includeAllDirectories: includeAllDirectories
+    )
     var existingIDs = Set(sessions.map { $0.codexHistoryID.trimmed }.filter { !$0.isEmpty })
     var changed = false
     if allowNewImports {
@@ -3611,16 +3796,26 @@ final class AppModel: ObservableObject {
   private func enqueueCodexPayloadOnA(
     kind: CodexPromptQueueKind,
     prompt: String,
-    environment: [String: String]? = nil
+    environment: [String: String]? = nil,
+    forceNew: Bool = false,
+    excludeHistoryIDs: [String] = []
   ) async -> CommandResult {
-    await runRemote(
+    var mergedEnvironment = environment ?? [:]
+    if forceNew {
+      mergedEnvironment["A_COCKPIT_CODEX_FORCE_NEW"] = "1"
+    }
+    if !excludeHistoryIDs.isEmpty {
+      mergedEnvironment["A_COCKPIT_CODEX_EXCLUDE_HISTORY_IDS"] =
+        excludeHistoryIDs.sorted().joined(separator: ",")
+    }
+    return await runRemote(
       kind == .steer ? "codex-queue-enqueue-steer" : "codex-queue-enqueue",
       args: [codexModel, codexReasoningEffort],
       input: prompt + "\n",
       timeout: 75,
       showsActivity: false,
       bypassBackgroundQueue: true,
-      environmentOverride: environment
+      environmentOverride: mergedEnvironment.isEmpty ? nil : mergedEnvironment
     )
   }
 
@@ -3695,12 +3890,10 @@ final class AppModel: ObservableObject {
       text: text,
       displayText: displayText
     )
-    if steer {
-      appendCodexLocalTurnBlock(
-        codexQueueBlock(for: visibleQueueItem(item), includeStatus: false),
-        preserveThroughCapture: true
-      )
-    }
+    appendCodexLocalTurnBlock(
+      codexQueueBlock(for: visibleQueueItem(item), includeStatus: false),
+      preserveThroughCapture: true
+    )
     codexInput = ""
     codexAttachments.removeAll()
     statusText =
@@ -3829,6 +4022,8 @@ final class AppModel: ObservableObject {
       targetSession.remoteDir.trimmed.isEmpty ? currentRemoteDir : targetSession.remoteDir)
     let environment = remoteEnvironment(for: targetSession, directory: targetDir)
     var jobs: [CodexAQueueBatchJob] = []
+    var assignedFreshStart = false
+    let sortedKnownHistoryIDs = Array(knownHistoryIDs).sorted()
     for item in batch {
       guard
         let prompt = await promptWithUploadedCodexAttachments(
@@ -3843,6 +4038,11 @@ final class AppModel: ObservableObject {
         continue
       }
       let order = String(format: "%013.0f", item.createdAt.timeIntervalSince1970 * 1000)
+      let startsFreshHistory =
+        targetSession.codexHistoryID.trimmed.isEmpty && item.kind == .send && !assignedFreshStart
+      if startsFreshHistory {
+        assignedFreshStart = true
+      }
       jobs.append(
         CodexAQueueBatchJob(
           clientID: item.id.uuidString,
@@ -3850,7 +4050,9 @@ final class AppModel: ObservableObject {
           prompt: prompt,
           order: order,
           historyID: targetSession.codexHistoryID.trimmed,
-          directory: targetDir
+          directory: targetDir,
+          forceNew: startsFreshHistory,
+          excludeHistoryIDs: startsFreshHistory ? sortedKnownHistoryIDs : []
         )
       )
     }
@@ -3931,10 +4133,13 @@ final class AppModel: ObservableObject {
       statusText = "Attachment upload failed · \(Date().shortStamp)"
       return
     }
+    let startsFreshHistory = targetSession.codexHistoryID.trimmed.isEmpty && item.kind == .send
     let result = await enqueueCodexPayloadOnA(
       kind: item.kind,
       prompt: prompt,
-      environment: environment
+      environment: environment,
+      forceNew: startsFreshHistory,
+      excludeHistoryIDs: startsFreshHistory ? Array(knownHistoryIDs).sorted() : []
     )
     if result.exitCode != 0 {
       updateCodexQueueItem(
@@ -4199,6 +4404,29 @@ final class AppModel: ObservableObject {
       selectedRemoteItem = item
     }
     await readRemoteFile(path)
+  }
+
+  func ensureCodexInlineImagePreview(for rawPath: String, context: String = "") async {
+    let requestedPath = codexRemotePathFromUserInput(rawPath)
+    guard !requestedPath.isEmpty else { return }
+    let resolvedPath = await resolveRemotePreviewPath(requestedPath, context: context)
+    guard previewKind(for: resolvedPath) == .image else { return }
+    if let cachedURL = cachedRemotePreviewURL(for: resolvedPath) {
+      codexInlineImagePreviewURLs[rawPath] = cachedURL
+      codexInlineImagePreviewURLs[resolvedPath] = cachedURL
+      return
+    }
+    let signature = await freshRemoteFileSignature(for: resolvedPath)
+    guard (signature?.size ?? maxInlineImagePreviewDownloadBytes) <= maxInlineImagePreviewDownloadBytes
+    else { return }
+    guard let url = await downloadRemoteFileToPreview(
+      resolvedPath,
+      attempts: 2,
+      useBackground: true,
+      expectedSignature: signature
+    ) else { return }
+    codexInlineImagePreviewURLs[rawPath] = url
+    codexInlineImagePreviewURLs[resolvedPath] = url
   }
 
   func previewCodexPath(_ path: String) async {
@@ -5877,11 +6105,31 @@ final class AppModel: ObservableObject {
       statusText = "File already saved · \(Date().shortStamp)"
       return
     }
-    let byteCount = remoteFileText.lengthOfBytes(using: .utf8)
+    let byteCount = Int64(remoteFileText.lengthOfBytes(using: .utf8))
+    beginFileTransferMode()
+    isBusy = true
+    let transferID = beginTrackedFileTransfer(
+      title: "Saving file on A",
+      source: "Editor buffer",
+      destination: path,
+      totalBytes: byteCount,
+      phase: byteCount >= Int64(largeRemoteTextSaveThreshold) ? "Preparing upload" : "Saving"
+    )
+    defer {
+      isBusy = false
+      endFileTransferMode()
+    }
+    statusText = "Saving file on A · \(Date().shortStamp)"
     let result: CommandResult
-    if byteCount >= largeRemoteTextSaveThreshold {
-      result = await saveRemoteTextFileViaUpload(path: path, text: remoteFileText)
+    if byteCount >= Int64(largeRemoteTextSaveThreshold) {
+      result = await saveRemoteTextFileViaUpload(
+        path: path,
+        text: remoteFileText,
+        progressID: transferID,
+        byteCount: byteCount
+      )
     } else {
+      updateTrackedFileTransfer(transferID, phase: "Writing", completedBytes: 0, totalBytes: byteCount)
       let payload = path + "\n" + remoteFileText
       result = await runRemote(
         "write-file",
@@ -5890,18 +6138,40 @@ final class AppModel: ObservableObject {
         showsActivity: false,
         bypassBackgroundQueue: true
       )
+      updateTrackedFileTransfer(
+        transferID,
+        phase: "Verifying",
+        completedBytes: result.exitCode == 0 ? byteCount : 0,
+        totalBytes: byteCount
+      )
     }
     lastMirrorLog = result.combined.isEmpty ? "Saved \(path)" : result.combined
     if result.exitCode == 0 {
       remoteFileSavedText = remoteFileText
       remoteTextPreviewCache[path] = remoteFileText
       statusText = "Saved file · \(Date().shortStamp)"
+      finishTrackedFileTransfer(
+        transferID,
+        succeeded: true,
+        message:
+          "Saved A file: \(path) · \(Self.fileSizeFormatter.string(fromByteCount: byteCount))"
+      )
     } else {
       statusText = "Save failed · \(Date().shortStamp)"
+      finishTrackedFileTransfer(
+        transferID,
+        succeeded: false,
+        message: "Save A failed: \(path)"
+      )
     }
   }
 
-  private func saveRemoteTextFileViaUpload(path: String, text: String) async -> CommandResult {
+  private func saveRemoteTextFileViaUpload(
+    path: String,
+    text: String,
+    progressID: UUID,
+    byteCount: Int64
+  ) async -> CommandResult {
     let localURL = FileManager.default.temporaryDirectory
       .appendingPathComponent("acontrol-save-\(UUID().uuidString).txt")
     do {
@@ -5913,16 +6183,32 @@ final class AppModel: ObservableObject {
       try? FileManager.default.removeItem(at: localURL)
     }
     let remoteTmp = "/tmp/.sshcontroll-save-\(UUID().uuidString).tmp"
-    beginFileTransferMode()
-    defer { endFileTransferMode() }
     statusText = "Uploading save to A · \(Date().shortStamp)"
-    let uploadBytes = Int64(text.lengthOfBytes(using: .utf8))
-    lastMirrorLog = "Save upload request sent: \(path)\n\(Self.fileSizeFormatter.string(fromByteCount: uploadBytes))"
+    lastMirrorLog = "Save upload request sent: \(path)\n\(Self.fileSizeFormatter.string(fromByteCount: byteCount))"
+    updateTrackedFileTransfer(
+      progressID,
+      phase: "Uploading",
+      completedBytes: 0,
+      totalBytes: byteCount
+    )
+    let progressMonitor = startRemoteFileProgressMonitor(
+      id: progressID,
+      path: remoteTmp,
+      totalBytes: byteCount,
+      phase: "Uploading"
+    )
     let upload = await runFastSCP(
       arguments: "\(localURL.path.shellQuoted) \(settings.remoteSpec(remoteTmp).shellQuoted)",
-      timeout: Self.transferTimeout(forByteCount: uploadBytes)
+      timeout: Self.transferTimeout(forByteCount: byteCount)
     )
+    progressMonitor.cancel()
     guard upload.exitCode == 0 else { return upload }
+    updateTrackedFileTransfer(
+      progressID,
+      phase: "Installing",
+      completedBytes: byteCount,
+      totalBytes: byteCount
+    )
     let install = await runRemote(
       "install-uploaded-file",
       input: remoteTmp + "\n" + path + "\n",
@@ -6043,6 +6329,142 @@ final class AppModel: ObservableObject {
       lines.append(details)
     }
     return lines.joined(separator: "\n")
+  }
+
+  private func beginTrackedFileTransfer(
+    title: String,
+    source: String,
+    destination: String,
+    totalBytes: Int64 = 0,
+    phase: String = "Preparing"
+  ) -> UUID {
+    var progress = FileTransferProgress(
+      title: title,
+      source: source,
+      destination: destination,
+      phase: phase,
+      completedBytes: 0,
+      totalBytes: max(0, totalBytes)
+    )
+    progress.updatedAt = Date()
+    activeFileTransfer = progress
+    appendFileTransferLog("\(phase): \(source) -> \(destination)")
+    return progress.id
+  }
+
+  private func updateTrackedFileTransfer(
+    _ id: UUID,
+    phase: String? = nil,
+    completedBytes: Int64? = nil,
+    totalBytes: Int64? = nil
+  ) {
+    guard var progress = activeFileTransfer, progress.id == id else { return }
+    if let phase {
+      progress.phase = phase
+    }
+    if let completedBytes {
+      progress.completedBytes = max(0, completedBytes)
+    }
+    if let totalBytes {
+      progress.totalBytes = max(0, totalBytes)
+    }
+    progress.updatedAt = Date()
+    activeFileTransfer = progress
+  }
+
+  private func finishTrackedFileTransfer(
+    _ id: UUID,
+    succeeded: Bool,
+    message: String
+  ) {
+    guard var progress = activeFileTransfer, progress.id == id else {
+      appendFileTransferLog(message)
+      return
+    }
+    if succeeded, progress.totalBytes > 0 {
+      progress.completedBytes = progress.totalBytes
+    }
+    progress.phase = succeeded ? "Complete" : "Failed"
+    progress.isFinished = true
+    progress.succeeded = succeeded
+    progress.updatedAt = Date()
+    activeFileTransfer = progress
+    appendFileTransferLog(message)
+    Task { [weak self] in
+      try? await Task.sleep(nanoseconds: 5_000_000_000)
+      await MainActor.run {
+        guard let self, self.activeFileTransfer?.id == id,
+          self.activeFileTransfer?.isFinished == true
+        else { return }
+        self.activeFileTransfer = nil
+      }
+    }
+  }
+
+  private func appendFileTransferLog(_ message: String) {
+    let stamp = Date().shortStamp
+    let entry = "[\(stamp)] \(message.trimmed)"
+    fileTransferLogEntries.append(entry)
+    fileTransferLogEntries = Array(fileTransferLogEntries.suffix(40))
+    if !fileTransferLogEntries.isEmpty {
+      lastMirrorLog = fileTransferLogEntries.joined(separator: "\n")
+    }
+  }
+
+  private func fileTransferLogText(with result: String) -> String {
+    var parts = fileTransferLogEntries
+    let trimmed = result.trimmed
+    if !trimmed.isEmpty {
+      parts.append(trimmed)
+    }
+    return parts.isEmpty ? result : parts.joined(separator: "\n")
+  }
+
+  private func startLocalFileProgressMonitor(
+    id: UUID,
+    url: URL,
+    totalBytes: Int64
+  ) -> Task<Void, Never> {
+    Task { [weak self] in
+      while !Task.isCancelled {
+        let bytes =
+          ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? NSNumber)?
+          .int64Value ?? 0
+        await MainActor.run {
+          self?.updateTrackedFileTransfer(
+            id,
+            phase: "Downloading",
+            completedBytes: bytes,
+            totalBytes: totalBytes
+          )
+        }
+        try? await Task.sleep(nanoseconds: 450_000_000)
+      }
+    }
+  }
+
+  private func startRemoteFileProgressMonitor(
+    id: UUID,
+    path: String,
+    totalBytes: Int64,
+    phase: String
+  ) -> Task<Void, Never> {
+    Task { [weak self] in
+      while !Task.isCancelled {
+        guard let self else { return }
+        if let bytes = await self.remoteFileSize(at: path) {
+          await MainActor.run {
+            self.updateTrackedFileTransfer(
+              id,
+              phase: phase,
+              completedBytes: bytes,
+              totalBytes: totalBytes
+            )
+          }
+        }
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+      }
+    }
   }
 
   private static func localByteCount(at url: URL) -> Int64 {
@@ -6396,7 +6818,8 @@ final class AppModel: ObservableObject {
   private func uploadLocalSelectionViaFastArchive(
     paths: [String],
     to targetDir: String,
-    label: String
+    label: String,
+    progressID: UUID? = nil
   ) async -> CommandResult {
     let workspaceURL = FileManager.default.temporaryDirectory
       .appendingPathComponent("acontrol-upload-\(UUID().uuidString)", isDirectory: true)
@@ -6418,6 +6841,10 @@ final class AppModel: ObservableObject {
       mkdir -p \(workspaceURL.path.shellQuoted)
       COPYFILE_DISABLE=1 /usr/bin/tar -cf \(archiveURL.path.shellQuoted) \(tarArgs)
       """
+    if let progressID {
+      updateTrackedFileTransfer(progressID, phase: "Archiving")
+      appendFileTransferLog("Archiving local selection: \(label)")
+    }
     let create = await client.shell(createArchiveScript, timeout: 3600)
     guard create.exitCode == 0 else { return create }
 
@@ -6436,12 +6863,32 @@ final class AppModel: ObservableObject {
     )
     guard mkdir.exitCode == 0 else { return mkdir }
 
+    if let progressID {
+      updateTrackedFileTransfer(
+        progressID,
+        phase: "Uploading archive",
+        completedBytes: 0,
+        totalBytes: archiveSize
+      )
+      appendFileTransferLog(
+        "Uploading archive to A: \(Self.fileSizeFormatter.string(fromByteCount: archiveSize))"
+      )
+    }
+    let progressMonitor = progressID.map {
+      startRemoteFileProgressMonitor(
+        id: $0,
+        path: remoteArchive,
+        totalBytes: archiveSize,
+        phase: "Uploading archive"
+      )
+    }
     let upload = await uploadLocalFileFastest(
       archiveURL,
       toRemoteFile: remoteArchive,
       expectedSize: archiveSize,
       timeout: Self.transferTimeout(forByteCount: archiveSize)
     )
+    progressMonitor?.cancel()
     guard upload.exitCode == 0 else {
       await deleteRemoteSaveTemporary(remoteArchive)
       return CommandResult(
@@ -6457,6 +6904,15 @@ final class AppModel: ObservableObject {
       )
     }
 
+    if let progressID {
+      updateTrackedFileTransfer(
+        progressID,
+        phase: "Installing on A",
+        completedBytes: archiveSize,
+        totalBytes: archiveSize
+      )
+      appendFileTransferLog("Installing uploaded archive on A: \(targetDir)")
+    }
     let extractRemote = """
       set -e
       mkdir -p \(targetDir.shellQuoted)
@@ -6492,27 +6948,47 @@ final class AppModel: ObservableObject {
     guard !paths.isEmpty else { return }
     let totalBytes = Self.localByteCount(paths: paths)
     let startedAt = Date()
+    let sourceDescription = paths.count == 1 ? paths[0] : "\(paths.count) local item(s)"
     beginFileTransferMode()
     isBusy = true
     defer {
       isBusy = false
       endFileTransferMode()
     }
+    let transferID = beginTrackedFileTransfer(
+      title: "Uploading to A",
+      source: sourceDescription,
+      destination: targetDir,
+      totalBytes: totalBytes,
+      phase: "Preparing"
+    )
     statusText = "Uploading to A · \(Date().shortStamp)"
     lastMirrorLog =
       "Upload request sent: \(paths.count) item(s)\nDestination: \(targetDir)\nMode: local tar + single rsync transfer, no compression"
     let result = await uploadLocalSelectionViaFastArchive(
       paths: paths,
       to: targetDir,
-      label: "\(paths.count) item(s)"
+      label: "\(paths.count) item(s)",
+      progressID: transferID
     )
     let elapsed = Date().timeIntervalSince(startedAt)
     let rate = Self.transferRateText(bytes: totalBytes, elapsed: elapsed)
     let sizeText = Self.fileSizeFormatter.string(fromByteCount: totalBytes)
+    finishTrackedFileTransfer(
+      transferID,
+      succeeded: result.exitCode == 0,
+      message:
+        result.exitCode == 0
+        ? "Uploaded: \(sourceDescription) -> \(targetDir) · \(sizeText) · \(rate)"
+        : "Upload failed: \(sourceDescription) -> \(targetDir)"
+    )
     lastMirrorLog =
       result.exitCode == 0
-      ? "Uploaded \(paths.count) item(s) to \(targetDir)\nSize: \(sizeText)\nSpeed: \(rate)\nMode: local tar + single rsync transfer, no compression"
-      : result.combined
+      ? fileTransferLogText(
+        with:
+          "Uploaded \(paths.count) item(s) to \(targetDir)\nSize: \(sizeText)\nSpeed: \(rate)\nMode: local tar + single rsync transfer, no compression"
+      )
+      : fileTransferLogText(with: result.combined)
     await loadFileBrowserDirectory(targetDir, force: true)
   }
 
@@ -6654,7 +7130,7 @@ final class AppModel: ObservableObject {
     defer { endFileTransferMode() }
     if items.count == 1, let item = items.first, !item.isDirectory {
       let result = await saveRemoteSingleFileFast(item, to: saveBaseURL)
-      lastMirrorLog = result.combined
+      lastMirrorLog = fileTransferLogText(with: result.combined)
       if result.exitCode == 0 {
         statusText = "Saved to C · \(Date().shortStamp)"
         openLocalFolder(saveBase)
@@ -6664,7 +7140,7 @@ final class AppModel: ObservableObject {
       return
     }
     let result = await saveRemoteSelectionFast(items, to: saveBaseURL)
-    lastMirrorLog = result.combined
+    lastMirrorLog = fileTransferLogText(with: result.combined)
     if result.exitCode == 0 {
       statusText = "Saved to C · \(Date().shortStamp)"
       openLocalFolder(saveBase)
@@ -6690,6 +7166,13 @@ final class AppModel: ObservableObject {
       isBusy = false
       try? FileManager.default.removeItem(at: partialURL)
     }
+    let transferID = beginTrackedFileTransfer(
+      title: "Saving A file",
+      source: selectionDescription,
+      destination: destinationURL.path,
+      totalBytes: max(0, item.size),
+      phase: "Preparing"
+    )
     let expectedSize =
       item.size > 0
       ? item.size : (await remoteFileSize(at: item.path) ?? 0)
@@ -6698,13 +7181,25 @@ final class AppModel: ObservableObject {
         "File save request sent: \(selectionDescription)\nDestination: \(destinationURL.path)\nSize: \(Self.fileSizeFormatter.string(fromByteCount: expectedSize))\nMode: single rsync transfer, no compression"
     }
     let transferTimeout = Self.transferTimeout(forByteCount: expectedSize)
+    updateTrackedFileTransfer(transferID, phase: "Downloading", totalBytes: expectedSize)
+    let progressMonitor = startLocalFileProgressMonitor(
+      id: transferID,
+      url: partialURL,
+      totalBytes: expectedSize
+    )
     let result = await downloadRemotePathFastest(
       item.path,
       to: partialURL,
       expectedSize: expectedSize,
       timeout: transferTimeout
     )
+    progressMonitor.cancel()
     guard result.exitCode == 0 else {
+      finishTrackedFileTransfer(
+        transferID,
+        succeeded: false,
+        message: "Failed: \(selectionDescription) -> \(destinationURL.path)"
+      )
       return CommandResult(
         exitCode: result.exitCode,
         output: "",
@@ -6718,6 +7213,7 @@ final class AppModel: ObservableObject {
       )
     }
     do {
+      updateTrackedFileTransfer(transferID, phase: "Verifying", completedBytes: expectedSize)
       try FileManager.default.createDirectory(
         at: saveBaseURL, withIntermediateDirectories: true)
       try FileManager.default.moveItem(at: partialURL, to: destinationURL)
@@ -6736,6 +7232,11 @@ final class AppModel: ObservableObject {
         expectedSize >= 8 * 1_024 * 1_024
         ? "single rsync transfer, no compression"
         : "single scp transfer, no compression"
+      finishTrackedFileTransfer(
+        transferID,
+        succeeded: true,
+        message: "Saved: \(destinationURL.path) · \(sizeText) · \(speedText)"
+      )
       return CommandResult(
         exitCode: 0,
         output:
@@ -6743,6 +7244,11 @@ final class AppModel: ObservableObject {
         error: result.error
       )
     } catch {
+      finishTrackedFileTransfer(
+        transferID,
+        succeeded: false,
+        message: "Save failed after transfer: \(error.localizedDescription)"
+      )
       return CommandResult(exitCode: 74, output: "", error: error.localizedDescription)
     }
   }
@@ -6771,6 +7277,12 @@ final class AppModel: ObservableObject {
     lastMirrorLog =
       "Folder save request sent: \(selectionDescription)\nDestination: \(saveBaseURL.path)\nMode: remote tar + single rsync transfer, no compression"
     statusText = "Folder save requested · \(Date().shortStamp)"
+    let transferID = beginTrackedFileTransfer(
+      title: "Saving A selection",
+      source: selectionDescription,
+      destination: saveBaseURL.path,
+      phase: "Preparing archive"
+    )
     let startedAt = Date()
     isBusy = true
     defer {
@@ -6786,7 +7298,14 @@ final class AppModel: ObservableObject {
       showsActivity: false,
       bypassBackgroundQueue: true
     )
-    guard mkdir.exitCode == 0 else { return mkdir }
+    guard mkdir.exitCode == 0 else {
+      finishTrackedFileTransfer(
+        transferID,
+        succeeded: false,
+        message: "Could not prepare A temporary folder: \(remoteTempRoot)"
+      )
+      return mkdir
+    }
 
     let createRemoteArchiveCommand =
       "\(remoteHelperShellCommand("tar-paths")) > \(remoteArchive.shellQuoted)"
@@ -6799,22 +7318,43 @@ final class AppModel: ObservableObject {
     let create = await client.shell(createScript, timeout: 3600)
     guard create.exitCode == 0 else {
       await deleteRemoteSaveTemporary(remoteArchive)
+      finishTrackedFileTransfer(
+        transferID,
+        succeeded: false,
+        message: "Archive preparation failed: \(selectionDescription)"
+      )
       return create
     }
     let archiveSize = await remoteFileSize(at: remoteArchive) ?? 0
     let sizeText = Self.fileSizeFormatter.string(fromByteCount: archiveSize)
+    updateTrackedFileTransfer(
+      transferID,
+      phase: "Downloading archive",
+      totalBytes: archiveSize
+    )
     lastMirrorLog =
       "Archive ready on A: \(selectionDescription)\nArchive size: \(sizeText)\nDownloading with single rsync transfer..."
     try? FileManager.default.createDirectory(at: workspaceURL, withIntermediateDirectories: true)
     let transferTimeout = Self.transferTimeout(forByteCount: archiveSize)
+    let progressMonitor = startLocalFileProgressMonitor(
+      id: transferID,
+      url: archiveURL,
+      totalBytes: archiveSize
+    )
     let download = await downloadRemotePathFastest(
       remoteArchive,
       to: archiveURL,
       expectedSize: archiveSize,
       timeout: transferTimeout
     )
+    progressMonitor.cancel()
     await deleteRemoteSaveTemporary(remoteArchive)
     guard download.exitCode == 0 else {
+      finishTrackedFileTransfer(
+        transferID,
+        succeeded: false,
+        message: "Download failed: \(selectionDescription) -> \(saveBaseURL.path)"
+      )
       return CommandResult(
         exitCode: download.exitCode,
         output: "",
@@ -6835,10 +7375,16 @@ final class AppModel: ObservableObject {
       """
     let extract = await client.shell(extractScript, timeout: 3600)
     guard extract.exitCode == 0 else {
+      finishTrackedFileTransfer(
+        transferID,
+        succeeded: false,
+        message: "Extract failed: \(selectionDescription)"
+      )
       return extract
     }
 
     do {
+      updateTrackedFileTransfer(transferID, phase: "Saving locally", completedBytes: archiveSize)
       let destinationURL: URL
       if items.count == 1, let item = items.first {
         let base = item.name.sanitizedFileName.trimmed.isEmpty
@@ -6858,6 +7404,12 @@ final class AppModel: ObservableObject {
         try FileManager.default.moveItem(at: extractURL, to: destinationURL)
       }
       let localBytes = Self.localByteCount(at: destinationURL)
+      finishTrackedFileTransfer(
+        transferID,
+        succeeded: true,
+        message:
+          "Saved: \(destinationURL.path) · \(Self.fileSizeFormatter.string(fromByteCount: localBytes))"
+      )
       return CommandResult(
         exitCode: 0,
         output:
@@ -6865,6 +7417,11 @@ final class AppModel: ObservableObject {
         error: [create.error, download.error, extract.error].filter { !$0.isEmpty }.joined(separator: "\n")
       )
     } catch {
+      finishTrackedFileTransfer(
+        transferID,
+        succeeded: false,
+        message: "Save failed after archive download: \(error.localizedDescription)"
+      )
       return CommandResult(exitCode: 74, output: "", error: error.localizedDescription)
     }
   }
@@ -7413,16 +7970,29 @@ final class AppModel: ObservableObject {
       isBusy = false
       endFileTransferMode()
     }
+    let transferID = beginTrackedFileTransfer(
+      title: "Uploading attachments",
+      source: "\(attachments.count) prompt attachment(s)",
+      destination: targetDir,
+      totalBytes: totalBytes,
+      phase: "Preparing"
+    )
     statusText = "Uploading attachment(s) to A · \(Date().shortStamp)"
     lastMirrorLog =
       "Uploading \(attachments.count) prompt attachment(s) to \(targetDir)\nMode: local tar + single rsync transfer, no compression"
     let result = await uploadLocalSelectionViaFastArchive(
       paths: [stagingURL.path + "/."],
       to: targetDir,
-      label: "\(attachments.count) prompt attachment(s)"
+      label: "\(attachments.count) prompt attachment(s)",
+      progressID: transferID
     )
     guard result.exitCode == 0 else {
-      lastMirrorLog = result.combined
+      finishTrackedFileTransfer(
+        transferID,
+        succeeded: false,
+        message: "Attachment upload failed: \(attachments.count) item(s) -> \(targetDir)"
+      )
+      lastMirrorLog = fileTransferLogText(with: result.combined)
       return []
     }
 
@@ -7431,8 +8001,16 @@ final class AppModel: ObservableObject {
       copy.remotePath = "\(targetDir)/\(uploadNames[attachment.id] ?? attachment.uploadName)"
       return copy
     }
-    lastMirrorLog =
+    let summary =
       "Uploaded \(uploaded.count) prompt attachment(s) to \(targetDir)\nSize: \(Self.fileSizeFormatter.string(fromByteCount: totalBytes))\nSpeed: \(Self.transferRateText(bytes: totalBytes, elapsed: Date().timeIntervalSince(startedAt)))\nMode: local tar + single rsync transfer, no compression"
+    finishTrackedFileTransfer(
+      transferID,
+      succeeded: true,
+      message:
+        "Uploaded attachments: \(uploaded.count) item(s) -> \(targetDir) · \(Self.fileSizeFormatter.string(fromByteCount: totalBytes))"
+    )
+    lastMirrorLog =
+      fileTransferLogText(with: summary)
     return uploaded
   }
 

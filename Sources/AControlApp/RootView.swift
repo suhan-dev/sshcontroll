@@ -199,7 +199,7 @@ struct RootView: View {
 
   private var sidebarBackground: some ShapeStyle {
     if colorScheme == .dark {
-      return AnyShapeStyle(Color(red: 0.045, green: 0.050, blue: 0.060))
+      return AnyShapeStyle(Color(red: 0.118, green: 0.127, blue: 0.144))
     }
     return AnyShapeStyle(Color(red: 0.965, green: 0.982, blue: 0.992))
   }

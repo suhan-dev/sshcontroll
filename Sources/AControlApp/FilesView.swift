@@ -33,68 +33,79 @@ struct FilesView: View {
   }
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 14) {
-      SectionHeader(title: "A Files", detail: activeFileDirectory) {
-        await model.loadFileBrowserDirectory(activeFileDirectory, force: true)
-      }
+    ZStack(alignment: .bottom) {
+      VStack(alignment: .leading, spacing: 14) {
+        SectionHeader(title: "A Files", detail: activeFileDirectory) {
+          await model.loadFileBrowserDirectory(activeFileDirectory, force: true)
+        }
 
-      GlassPanel(title: nil) {
-        ScrollView(.horizontal, showsIndicators: false) {
-          HStack(spacing: 10) {
-            PrimaryButton(title: "Upload", symbol: "square.and.arrow.up", tint: .blue) {
-              Task { await model.uploadFilesToA() }
-            }
-            PrimaryButton(title: "Save", symbol: "square.and.arrow.down", tint: .teal) {
-              Task { await model.saveASelectionToC() }
-            }
-            .disabled(model.selectedRemoteItemIDs.isEmpty)
-            PrimaryButton(title: "Delete", symbol: "trash", tint: .red) {
-              Task { await model.deleteRemoteSelection() }
-            }
-            .disabled(model.selectedRemoteItemIDs.isEmpty)
-            TextField("Search A files", text: $model.searchText)
-              .textFieldStyle(.plain)
-              .font(.system(size: 13, weight: .medium))
-              .padding(.horizontal, 12)
-              .frame(width: 230, height: 36)
-              .background(AControlStyle.insetFill(colorScheme), in: Capsule())
-              .overlay {
-                Capsule().strokeBorder(AControlStyle.hairline(colorScheme), lineWidth: 1)
+        GlassPanel(title: nil) {
+          ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+              PrimaryButton(title: "Upload", symbol: "square.and.arrow.up", tint: .blue) {
+                Task { await model.uploadFilesToA() }
               }
-            TextField("Open remote path", text: $model.remoteOpenPath)
-              .textFieldStyle(.plain)
-              .font(.system(size: 13, weight: .medium, design: .monospaced))
-              .padding(.horizontal, 12)
-              .frame(width: 340, height: 36)
-              .background(AControlStyle.insetFill(colorScheme), in: Capsule())
-              .overlay {
-                Capsule().strokeBorder(AControlStyle.hairline(colorScheme), lineWidth: 1)
+              PrimaryButton(title: "Save", symbol: "square.and.arrow.down", tint: .teal) {
+                Task { await model.saveASelectionToC() }
               }
-              .onSubmit {
+              .disabled(model.selectedRemoteItemIDs.isEmpty)
+              PrimaryButton(title: "Delete", symbol: "trash", tint: .red) {
+                Task { await model.deleteRemoteSelection() }
+              }
+              .disabled(model.selectedRemoteItemIDs.isEmpty)
+              TextField("Search A files", text: $model.searchText)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13, weight: .medium))
+                .padding(.horizontal, 12)
+                .frame(width: 230, height: 36)
+                .background(AControlStyle.insetFill(colorScheme), in: Capsule())
+                .overlay {
+                  Capsule().strokeBorder(AControlStyle.hairline(colorScheme), lineWidth: 1)
+                }
+              TextField("Open remote path", text: $model.remoteOpenPath)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13, weight: .medium, design: .monospaced))
+                .padding(.horizontal, 12)
+                .frame(width: 340, height: 36)
+                .background(AControlStyle.insetFill(colorScheme), in: Capsule())
+                .overlay {
+                  Capsule().strokeBorder(AControlStyle.hairline(colorScheme), lineWidth: 1)
+                }
+                .onSubmit {
+                  Task { await model.openRemotePathFromInput() }
+                }
+              PrimaryButton(title: "Open Path", symbol: "arrow.up.right.square", tint: .teal) {
                 Task { await model.openRemotePathFromInput() }
               }
-            PrimaryButton(title: "Open Path", symbol: "arrow.up.right.square", tint: .teal) {
-              Task { await model.openRemotePathFromInput() }
+              .disabled(model.remoteOpenPath.trimmed.isEmpty)
             }
-            .disabled(model.remoteOpenPath.trimmed.isEmpty)
+          }
+        }
+
+        HStack(spacing: 16) {
+          explorerPanel
+          editorPanel
+        }
+        .layoutPriority(1)
+
+        if !model.lastMirrorLog.isEmpty && model.activeFileTransfer == nil {
+          GlassPanel(title: "Last File Operation", symbol: "text.alignleft", accent: .orange) {
+            TranscriptView(
+              text: model.lastMirrorLog,
+              placeholder: "File transfer and save results will appear here."
+            )
+            .frame(minHeight: 110, idealHeight: 130, maxHeight: 170)
           }
         }
       }
+      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
-      HStack(spacing: 16) {
-        explorerPanel
-        editorPanel
-      }
-      .layoutPriority(1)
-
-      if !model.lastMirrorLog.isEmpty {
-        GlassPanel(title: "Last File Operation", symbol: "text.alignleft", accent: .orange) {
-          TranscriptView(
-            text: model.lastMirrorLog,
-            placeholder: "File transfer and save results will appear here."
-          )
-          .frame(minHeight: 160, idealHeight: 190, maxHeight: 260)
-        }
+      if let progress = model.activeFileTransfer {
+        FileTransferFloatingStatus(progress: progress)
+          .padding(.horizontal, 18)
+          .padding(.bottom, 12)
+          .transition(.move(edge: .bottom).combined(with: .opacity))
+          .zIndex(20)
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -261,7 +272,8 @@ struct FilesView: View {
 
   private var listFill: some ShapeStyle {
     colorScheme == .dark
-      ? AnyShapeStyle(Color.white.opacity(0.045)) : AnyShapeStyle(Color.white.opacity(0.62))
+      ? AnyShapeStyle(Color(red: 0.145, green: 0.153, blue: 0.170))
+      : AnyShapeStyle(Color.white.opacity(0.62))
   }
 }
 
@@ -347,7 +359,9 @@ struct RemoteFileRow: View {
     if isSelected {
       return Color.accentColor.opacity(colorScheme == .dark ? 0.20 : 0.12)
     }
-    return Color.primary.opacity(colorScheme == .dark ? 0.055 : 0.035)
+    return colorScheme == .dark
+      ? Color(red: 0.175, green: 0.184, blue: 0.202)
+      : Color.primary.opacity(0.035)
   }
 
   private func fileSymbol(_ name: String) -> String {
@@ -455,7 +469,93 @@ struct RemotePreviewPane: View {
   }
 
   private var previewFill: some ShapeStyle {
-    colorScheme == .dark ? AnyShapeStyle(.thinMaterial) : AnyShapeStyle(Color.white.opacity(0.64))
+    colorScheme == .dark
+      ? AnyShapeStyle(Color(red: 0.142, green: 0.150, blue: 0.166))
+      : AnyShapeStyle(Color.white.opacity(0.64))
+  }
+}
+
+private struct FileTransferFloatingStatus: View {
+  @Environment(\.colorScheme) private var colorScheme
+  var progress: FileTransferProgress
+
+  var body: some View {
+    HStack(spacing: 12) {
+      Image(systemName: progressIcon)
+        .font(.system(size: 14, weight: .bold))
+        .foregroundStyle(AControlStyle.accentForeground(progressColor, colorScheme))
+        .frame(width: 28, height: 28)
+        .background(AControlStyle.accentFill(progressColor, colorScheme), in: Circle())
+
+      VStack(alignment: .leading, spacing: 5) {
+        HStack(spacing: 8) {
+          Text(progress.title)
+            .font(.system(size: 12.5, weight: .bold))
+            .lineLimit(1)
+          Text(progress.phase)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+          Spacer(minLength: 8)
+          Text(progress.sizeDescription)
+            .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+        }
+        HStack(spacing: 8) {
+          Text(progress.source)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+          Spacer(minLength: 8)
+          Text(progress.elapsedDescription)
+            .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+            .foregroundStyle(.tertiary)
+        }
+        HStack(spacing: 8) {
+          if let fraction = progress.fraction {
+            ProgressView(value: fraction)
+              .progressViewStyle(.linear)
+              .frame(maxWidth: .infinity)
+            Text("\(Int((fraction * 100).rounded()))%")
+              .font(.system(size: 11, weight: .bold, design: .monospaced))
+              .foregroundStyle(.secondary)
+              .frame(width: 44, alignment: .trailing)
+          } else {
+            ProgressView()
+              .controlSize(.small)
+            Text(progress.destination)
+              .font(.caption)
+              .foregroundStyle(.secondary)
+              .lineLimit(1)
+              .truncationMode(.middle)
+          }
+        }
+      }
+    }
+    .padding(.horizontal, 14)
+    .padding(.vertical, 11)
+    .frame(maxWidth: 860)
+    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    .overlay {
+      RoundedRectangle(cornerRadius: 8, style: .continuous)
+        .strokeBorder(AControlStyle.hairline(colorScheme), lineWidth: 1)
+    }
+    .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.28 : 0.12), radius: 18, x: 0, y: 8)
+  }
+
+  private var progressColor: Color {
+    if progress.succeeded == false { return .red }
+    if progress.isFinished { return .green }
+    return .teal
+  }
+
+  private var progressIcon: String {
+    if progress.succeeded == false { return "xmark" }
+    if progress.isFinished { return "checkmark" }
+    if progress.title.lowercased().contains("upload") { return "arrow.up.circle" }
+    return "arrow.down.circle"
   }
 }
 

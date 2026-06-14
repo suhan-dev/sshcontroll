@@ -14,6 +14,8 @@ dist/
 SHA256SUMS.txt
 
 # Local runtime data
+.codex/
+script/
 settings.json
 sessions.json
 Prompt Attachments/

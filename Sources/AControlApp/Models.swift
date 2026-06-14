@@ -64,6 +64,27 @@ enum AppTheme: String, CaseIterable, Identifiable, Codable {
   }
 }
 
+enum ConnectionNetworkProfile: String, CaseIterable, Identifiable, Codable {
+  case otherNetwork
+  case sameNetwork
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .otherNetwork: "Other network"
+    case .sameNetwork: "Same network"
+    }
+  }
+
+  var symbol: String {
+    switch self {
+    case .otherNetwork: "globe"
+    case .sameNetwork: "wifi"
+    }
+  }
+}
+
 enum MacPrivacyPane: String, CaseIterable, Identifiable, Codable {
   case fullDiskAccess
   case accessibility
@@ -206,9 +227,16 @@ enum SessionNameSource: String, Codable, Hashable {
 
 struct AppSettings: Codable, Equatable {
   var remoteLabel: String
+  var selectedNetworkProfile: ConnectionNetworkProfile
   var hostAlias: String
   var sshIdentityFile: String
   var sshPort: String
+  var sameNetworkHostAlias: String
+  var sameNetworkSSHPort: String
+  var sameNetworkLatencyTarget: String
+  var otherNetworkHostAlias: String
+  var otherNetworkSSHPort: String
+  var otherNetworkLatencyTarget: String
   var remoteHome: String
   var remoteScript: String
   var codexPath: String
@@ -226,9 +254,16 @@ struct AppSettings: Codable, Equatable {
   static var defaults: AppSettings {
     AppSettings(
       remoteLabel: "A",
+      selectedNetworkProfile: .otherNetwork,
       hostAlias: "",
       sshIdentityFile: "",
       sshPort: "",
+      sameNetworkHostAlias: "",
+      sameNetworkSSHPort: "",
+      sameNetworkLatencyTarget: "",
+      otherNetworkHostAlias: "",
+      otherNetworkSSHPort: "",
+      otherNetworkLatencyTarget: "",
       remoteHome: "~",
       remoteScript: "~/.local/bin/a-cockpit-remote",
       codexPath: "",
@@ -247,9 +282,16 @@ struct AppSettings: Codable, Equatable {
 
   init(
     remoteLabel: String,
+    selectedNetworkProfile: ConnectionNetworkProfile,
     hostAlias: String,
     sshIdentityFile: String,
     sshPort: String,
+    sameNetworkHostAlias: String,
+    sameNetworkSSHPort: String,
+    sameNetworkLatencyTarget: String,
+    otherNetworkHostAlias: String,
+    otherNetworkSSHPort: String,
+    otherNetworkLatencyTarget: String,
     remoteHome: String,
     remoteScript: String,
     codexPath: String,
@@ -265,9 +307,16 @@ struct AppSettings: Codable, Equatable {
     permissionTargets: [RemotePermissionTarget]
   ) {
     self.remoteLabel = remoteLabel
+    self.selectedNetworkProfile = selectedNetworkProfile
     self.hostAlias = hostAlias
     self.sshIdentityFile = sshIdentityFile
     self.sshPort = sshPort
+    self.sameNetworkHostAlias = sameNetworkHostAlias
+    self.sameNetworkSSHPort = sameNetworkSSHPort
+    self.sameNetworkLatencyTarget = sameNetworkLatencyTarget
+    self.otherNetworkHostAlias = otherNetworkHostAlias
+    self.otherNetworkSSHPort = otherNetworkSSHPort
+    self.otherNetworkLatencyTarget = otherNetworkLatencyTarget
     self.remoteHome = remoteHome
     self.remoteScript = remoteScript
     self.codexPath = codexPath
@@ -285,9 +334,16 @@ struct AppSettings: Codable, Equatable {
 
   enum CodingKeys: String, CodingKey {
     case remoteLabel
+    case selectedNetworkProfile
     case hostAlias
     case sshIdentityFile
     case sshPort
+    case sameNetworkHostAlias
+    case sameNetworkSSHPort
+    case sameNetworkLatencyTarget
+    case otherNetworkHostAlias
+    case otherNetworkSSHPort
+    case otherNetworkLatencyTarget
     case remoteHome
     case remoteScript
     case codexPath
@@ -308,11 +364,32 @@ struct AppSettings: Codable, Equatable {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     remoteLabel =
       try container.decodeIfPresent(String.self, forKey: .remoteLabel) ?? defaults.remoteLabel
+    selectedNetworkProfile =
+      try container.decodeIfPresent(ConnectionNetworkProfile.self, forKey: .selectedNetworkProfile)
+      ?? defaults.selectedNetworkProfile
     hostAlias = try container.decodeIfPresent(String.self, forKey: .hostAlias) ?? defaults.hostAlias
     sshIdentityFile =
       try container.decodeIfPresent(String.self, forKey: .sshIdentityFile)
       ?? defaults.sshIdentityFile
     sshPort = try container.decodeIfPresent(String.self, forKey: .sshPort) ?? defaults.sshPort
+    sameNetworkHostAlias =
+      try container.decodeIfPresent(String.self, forKey: .sameNetworkHostAlias)
+      ?? defaults.sameNetworkHostAlias
+    sameNetworkSSHPort =
+      try container.decodeIfPresent(String.self, forKey: .sameNetworkSSHPort)
+      ?? defaults.sameNetworkSSHPort
+    sameNetworkLatencyTarget =
+      try container.decodeIfPresent(String.self, forKey: .sameNetworkLatencyTarget)
+      ?? defaults.sameNetworkLatencyTarget
+    otherNetworkHostAlias =
+      try container.decodeIfPresent(String.self, forKey: .otherNetworkHostAlias)
+      ?? defaults.otherNetworkHostAlias
+    otherNetworkSSHPort =
+      try container.decodeIfPresent(String.self, forKey: .otherNetworkSSHPort)
+      ?? defaults.otherNetworkSSHPort
+    otherNetworkLatencyTarget =
+      try container.decodeIfPresent(String.self, forKey: .otherNetworkLatencyTarget)
+      ?? defaults.otherNetworkLatencyTarget
     remoteHome =
       try container.decodeIfPresent(String.self, forKey: .remoteHome) ?? defaults.remoteHome
     remoteScript =
@@ -341,7 +418,68 @@ struct AppSettings: Codable, Equatable {
     permissionTargets =
       try container.decodeIfPresent([RemotePermissionTarget].self, forKey: .permissionTargets)
       ?? defaults.permissionTargets
+    seedNetworkProfilesIfNeeded()
     ensureDefaultPermissionTargets()
+  }
+
+  mutating func seedNetworkProfilesIfNeeded() {
+    switch selectedNetworkProfile {
+    case .otherNetwork:
+      if otherNetworkHostAlias.trimmed.isEmpty { otherNetworkHostAlias = hostAlias }
+      if otherNetworkSSHPort.trimmed.isEmpty { otherNetworkSSHPort = sshPort }
+      if otherNetworkLatencyTarget.trimmed.isEmpty { otherNetworkLatencyTarget = latencyTarget }
+    case .sameNetwork:
+      if sameNetworkHostAlias.trimmed.isEmpty { sameNetworkHostAlias = hostAlias }
+      if sameNetworkSSHPort.trimmed.isEmpty { sameNetworkSSHPort = sshPort }
+      if sameNetworkLatencyTarget.trimmed.isEmpty { sameNetworkLatencyTarget = latencyTarget }
+    }
+  }
+
+  mutating func storeActiveConnectionInSelectedProfile() {
+    storeConnection(hostAlias: hostAlias, sshPort: sshPort, latencyTarget: latencyTarget, in: selectedNetworkProfile)
+  }
+
+  mutating func applyNetworkProfile(_ profile: ConnectionNetworkProfile) {
+    selectedNetworkProfile = profile
+    let values = connectionValues(for: profile)
+    if !values.hostAlias.trimmed.isEmpty {
+      hostAlias = values.hostAlias
+    }
+    if !values.sshPort.trimmed.isEmpty {
+      sshPort = values.sshPort
+    }
+    if !values.latencyTarget.trimmed.isEmpty {
+      latencyTarget = values.latencyTarget
+    }
+  }
+
+  mutating func storeConnection(
+    hostAlias: String,
+    sshPort: String,
+    latencyTarget: String,
+    in profile: ConnectionNetworkProfile
+  ) {
+    switch profile {
+    case .otherNetwork:
+      otherNetworkHostAlias = hostAlias
+      otherNetworkSSHPort = sshPort
+      otherNetworkLatencyTarget = latencyTarget
+    case .sameNetwork:
+      sameNetworkHostAlias = hostAlias
+      sameNetworkSSHPort = sshPort
+      sameNetworkLatencyTarget = latencyTarget
+    }
+  }
+
+  func connectionValues(for profile: ConnectionNetworkProfile) -> (
+    hostAlias: String, sshPort: String, latencyTarget: String
+  ) {
+    switch profile {
+    case .otherNetwork:
+      return (otherNetworkHostAlias, otherNetworkSSHPort, otherNetworkLatencyTarget)
+    case .sameNetwork:
+      return (sameNetworkHostAlias, sameNetworkSSHPort, sameNetworkLatencyTarget)
+    }
   }
 
   mutating func ensureDefaultPermissionTargets() {
@@ -376,10 +514,13 @@ struct AppSettings: Codable, Equatable {
       "-o", "BatchMode=yes",
       "-o", "LogLevel=ERROR",
       "-o", "ControlMaster=auto",
-      "-o", "ControlPersist=120",
+      "-o", "ControlPersist=600",
       "-o", "ControlPath=\(controlPath)",
+      "-o", "ConnectTimeout=8",
+      "-o", "ConnectionAttempts=1",
       "-o", "ServerAliveInterval=15",
       "-o", "ServerAliveCountMax=2",
+      "-o", "TCPKeepAlive=yes",
     ]
     if !normalizedSSHPort.isEmpty {
       options += ["-p", normalizedSSHPort]
@@ -396,10 +537,13 @@ struct AppSettings: Codable, Equatable {
       "-o BatchMode=yes",
       "-o LogLevel=ERROR",
       "-o ControlMaster=auto",
-      "-o ControlPersist=120",
+      "-o ControlPersist=600",
       "-o ControlPath=\(controlPath.shellQuoted)",
+      "-o ConnectTimeout=8",
+      "-o ConnectionAttempts=1",
       "-o ServerAliveInterval=15",
       "-o ServerAliveCountMax=2",
+      "-o TCPKeepAlive=yes",
     ]
     if !normalizedSSHPort.isEmpty {
       options += ["-P", normalizedSSHPort.shellQuoted]
@@ -416,10 +560,13 @@ struct AppSettings: Codable, Equatable {
       "-o BatchMode=yes",
       "-o LogLevel=ERROR",
       "-o ControlMaster=auto",
-      "-o ControlPersist=120",
+      "-o ControlPersist=600",
       "-o ControlPath=\(controlPath.shellQuoted)",
+      "-o ConnectTimeout=8",
+      "-o ConnectionAttempts=1",
       "-o ServerAliveInterval=15",
       "-o ServerAliveCountMax=2",
+      "-o TCPKeepAlive=yes",
     ]
     if !normalizedSSHPort.isEmpty {
       options += ["-p", normalizedSSHPort.shellQuoted]
@@ -438,8 +585,11 @@ struct AppSettings: Codable, Equatable {
       "-o ControlPath=none",
       "-o Compression=no",
       "-o IPQoS=throughput",
+      "-o ConnectTimeout=10",
+      "-o ConnectionAttempts=1",
       "-o ServerAliveInterval=15",
       "-o ServerAliveCountMax=4",
+      "-o TCPKeepAlive=yes",
     ]
     if !normalizedSSHPort.isEmpty {
       options += ["-p", normalizedSSHPort.shellQuoted]
@@ -530,6 +680,41 @@ struct RemoteItem: Identifiable, Codable, Hashable, Sendable {
 
   var id: String { path }
   var isDirectory: Bool { type == "dir" }
+}
+
+struct FileTransferProgress: Identifiable, Equatable {
+  var id = UUID()
+  var title: String
+  var source: String
+  var destination: String
+  var phase: String
+  var completedBytes: Int64
+  var totalBytes: Int64
+  var startedAt = Date()
+  var updatedAt = Date()
+  var isFinished = false
+  var succeeded: Bool?
+
+  var fraction: Double? {
+    guard totalBytes > 0 else { return nil }
+    return min(1, max(0, Double(completedBytes) / Double(totalBytes)))
+  }
+
+  var sizeDescription: String {
+    if totalBytes > 0 {
+      return "\(ByteCountFormatter.string(fromByteCount: completedBytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file))"
+    }
+    if completedBytes > 0 {
+      return ByteCountFormatter.string(fromByteCount: completedBytes, countStyle: .file)
+    }
+    return "Preparing"
+  }
+
+  var elapsedDescription: String {
+    let seconds = max(0, Int(Date().timeIntervalSince(startedAt)))
+    if seconds < 60 { return "\(seconds)s" }
+    return "\(seconds / 60)m \(seconds % 60)s"
+  }
 }
 
 struct PromptAttachment: Identifiable, Hashable, Codable {

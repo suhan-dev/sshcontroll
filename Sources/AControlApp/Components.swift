@@ -14,8 +14,8 @@ enum AControlStyle {
       return AnyShapeStyle(
         LinearGradient(
           colors: [
-            Color(red: 0.055, green: 0.060, blue: 0.070),
-            Color(red: 0.035, green: 0.038, blue: 0.048),
+            Color(red: 0.145, green: 0.152, blue: 0.166),
+            Color(red: 0.112, green: 0.120, blue: 0.136),
           ],
           startPoint: .top,
           endPoint: .bottom
@@ -36,31 +36,31 @@ enum AControlStyle {
 
   static func panelFill(_ scheme: ColorScheme) -> AnyShapeStyle {
     if scheme == .dark {
-      return AnyShapeStyle(Color.white.opacity(0.055))
+      return AnyShapeStyle(Color(red: 0.168, green: 0.176, blue: 0.192))
     }
     return AnyShapeStyle(Color.white.opacity(0.94))
   }
 
   static func insetFill(_ scheme: ColorScheme) -> AnyShapeStyle {
     if scheme == .dark {
-      return AnyShapeStyle(Color.black.opacity(0.18))
+      return AnyShapeStyle(Color(red: 0.205, green: 0.214, blue: 0.232))
     }
     return AnyShapeStyle(Color.white.opacity(0.88))
   }
 
   static func transcriptFill(_ scheme: ColorScheme) -> AnyShapeStyle {
     if scheme == .dark {
-      return AnyShapeStyle(Color(red: 0.040, green: 0.043, blue: 0.047))
+      return AnyShapeStyle(Color(red: 0.126, green: 0.134, blue: 0.150))
     }
     return AnyShapeStyle(Color.white.opacity(0.98))
   }
 
   static func hairline(_ scheme: ColorScheme) -> Color {
-    scheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.075)
+    scheme == .dark ? Color.white.opacity(0.14) : Color.black.opacity(0.075)
   }
 
   static func softShadow(_ scheme: ColorScheme) -> Color {
-    scheme == .dark ? Color.black.opacity(0.28) : Color.black.opacity(0.045)
+    scheme == .dark ? Color.black.opacity(0.18) : Color.black.opacity(0.045)
   }
 
   static func accentFill(_ color: Color, _ scheme: ColorScheme) -> Color {

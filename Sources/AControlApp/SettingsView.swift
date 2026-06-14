@@ -13,6 +13,10 @@ struct SettingsView: View {
     case sshTarget
     case sshKeyPath
     case latencyTarget
+    case sameNetworkTarget
+    case sameNetworkLatency
+    case otherNetworkTarget
+    case otherNetworkLatency
     case appleTeamID
   }
 
@@ -23,6 +27,7 @@ struct SettingsView: View {
 
         GlassPanel(title: "Connection", symbol: "network", accent: .cyan) {
           settingsField("Remote Label", text: $model.settings.remoteLabel, showsSavedState: true)
+          connectionProfileControls()
           protectedSettingsField(
             "SSH Target",
             text: $model.settings.hostAlias,
@@ -473,6 +478,141 @@ struct SettingsView: View {
       SoftButton(title: "Choose", symbol: "key") {
         model.chooseSSHKeyFile()
         revealedSensitiveFields.remove(.sshKeyPath)
+      }
+    }
+  }
+
+  private func connectionProfileControls() -> some View {
+    VStack(alignment: .leading, spacing: 10) {
+      HStack {
+        fieldLabel("Network")
+        Picker(
+          "Network",
+          selection: Binding(
+            get: { model.settings.selectedNetworkProfile },
+            set: { profile in
+              model.selectConnectionNetworkProfile(profile)
+            }
+          )
+        ) {
+          ForEach(ConnectionNetworkProfile.allCases) { profile in
+            Label(profile.title, systemImage: profile.symbol).tag(profile)
+          }
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 360)
+        SoftButton(title: "Save Current", symbol: "tray.and.arrow.down") {
+          model.saveCurrentConnectionToSelectedProfile()
+        }
+        .safeHelp("Save the current SSH Target, Port, and Latency Target into the active network profile.")
+        Spacer()
+      }
+
+      HStack(alignment: .top, spacing: 10) {
+        connectionProfileCard(
+          profile: .otherNetwork,
+          target: $model.settings.otherNetworkHostAlias,
+          port: $model.settings.otherNetworkSSHPort,
+          latency: $model.settings.otherNetworkLatencyTarget,
+          targetField: .otherNetworkTarget,
+          latencyField: .otherNetworkLatency
+        )
+        connectionProfileCard(
+          profile: .sameNetwork,
+          target: $model.settings.sameNetworkHostAlias,
+          port: $model.settings.sameNetworkSSHPort,
+          latency: $model.settings.sameNetworkLatencyTarget,
+          targetField: .sameNetworkTarget,
+          latencyField: .sameNetworkLatency
+        )
+      }
+    }
+  }
+
+  private func connectionProfileCard(
+    profile: ConnectionNetworkProfile,
+    target: Binding<String>,
+    port: Binding<String>,
+    latency: Binding<String>,
+    targetField: SensitiveSettingsField,
+    latencyField: SensitiveSettingsField
+  ) -> some View {
+    let isActive = model.settings.selectedNetworkProfile == profile
+    return VStack(alignment: .leading, spacing: 8) {
+      HStack(spacing: 8) {
+        Image(systemName: profile.symbol)
+          .foregroundStyle(AControlStyle.accentForeground(.cyan, colorScheme))
+        Text(profile.title)
+          .font(.caption.weight(.bold))
+        Spacer()
+        SoftButton(title: isActive ? "Active" : "Use", symbol: "arrow.right.circle") {
+          model.selectConnectionNetworkProfile(profile)
+        }
+        .disabled(isActive)
+      }
+      profileSensitiveField(
+        "Target",
+        text: target,
+        prompt: profile == .otherNetwork ? "user@public-ip-or-hostname" : "user@local-ip-or-hostname",
+        id: targetField,
+        shouldProtect: containsNetworkAddress(target.wrappedValue)
+      )
+      profileTextField("Port", text: port, prompt: "22 or 20022")
+      profileSensitiveField(
+        "Latency",
+        text: latency,
+        prompt: "optional host/ip",
+        id: latencyField,
+        shouldProtect: containsNetworkAddress(latency.wrappedValue)
+      )
+    }
+    .padding(10)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(
+      AControlStyle.insetFill(colorScheme),
+      in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+    )
+    .overlay {
+      RoundedRectangle(cornerRadius: 8, style: .continuous)
+        .strokeBorder(
+          isActive ? AControlStyle.accentStroke(.cyan, colorScheme) : AControlStyle.hairline(colorScheme),
+          lineWidth: 1
+        )
+    }
+  }
+
+  private func profileTextField(_ label: String, text: Binding<String>, prompt: String) -> some View {
+    HStack(spacing: 8) {
+      Text(label)
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(.secondary)
+        .frame(width: 56, alignment: .leading)
+      TextField(prompt, text: text)
+        .textFieldStyle(.roundedBorder)
+        .font(.system(.caption, design: .monospaced))
+    }
+  }
+
+  private func profileSensitiveField(
+    _ label: String,
+    text: Binding<String>,
+    prompt: String,
+    id: SensitiveSettingsField,
+    shouldProtect: Bool
+  ) -> some View {
+    let shouldBlur =
+      shouldProtect && !text.wrappedValue.trimmed.isEmpty && !revealedSensitiveFields.contains(id)
+    return HStack(spacing: 8) {
+      Text(label)
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(.secondary)
+        .frame(width: 56, alignment: .leading)
+      if shouldBlur {
+        sensitiveValueButton(value: text.wrappedValue, prompt: prompt, id: id, forceBlur: true)
+      } else {
+        TextField(prompt, text: text)
+          .textFieldStyle(.roundedBorder)
+          .font(.system(.caption, design: .monospaced))
       }
     }
   }

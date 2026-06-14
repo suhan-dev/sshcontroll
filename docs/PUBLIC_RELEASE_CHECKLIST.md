@@ -38,15 +38,15 @@ Verify:
 
 ```bash
 (cd dist && shasum -a 256 -c SHA256SUMS.txt)
-pkgutil --payload-files dist/SSHcontroll-0.2.0-macOS.pkg | head
-unzip -l dist/SSHcontroll-0.2.0-macOS.zip | head
+pkgutil --payload-files dist/SSHcontroll-0.2.1-macOS.pkg | head
+unzip -l dist/SSHcontroll-0.2.1-macOS.zip | head
 ```
 
 Optional signing/notarization:
 
 ```bash
 codesign --verify --deep --strict .build/SSHcontroll.app
-pkgutil --check-signature dist/SSHcontroll-0.2.0-macOS.pkg
+pkgutil --check-signature dist/SSHcontroll-0.2.1-macOS.pkg
 ```
 
 Unsigned local packages are acceptable for private testing. Public releases

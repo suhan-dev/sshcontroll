@@ -60,8 +60,8 @@ Scripts/package-macos.sh
 Release files are written to `dist/`:
 
 ```text
-dist/SSHcontroll-0.2.0-macOS.pkg
-dist/SSHcontroll-0.2.0-macOS.zip
+dist/SSHcontroll-0.2.1-macOS.pkg
+dist/SSHcontroll-0.2.1-macOS.zip
 dist/SHA256SUMS.txt
 ```
 

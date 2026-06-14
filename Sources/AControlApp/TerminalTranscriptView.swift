@@ -253,6 +253,7 @@ private struct TerminalTranscriptRenderer {
   private func compactDisplayLines(_ value: String) -> [String] {
     var rows: [String] = []
     var previousWasBlank = false
+    var lastPromptSignature: String?
     for rawLine in value.components(separatedBy: .newlines) {
       let line = rawLine.trimmingCharacters(in: .whitespaces)
       let plain = stripANSI(line).trimmed
@@ -270,6 +271,19 @@ private struct TerminalTranscriptRenderer {
         }
         continue
       }
+      if let signature = promptSignature(line) {
+        if signature == lastPromptSignature {
+          previousWasBlank = false
+          continue
+        }
+        lastPromptSignature = signature
+      } else {
+        lastPromptSignature = nil
+      }
+      if let previous = rows.last, isDuplicatePromptLine(current: line, previous: previous) {
+        previousWasBlank = false
+        continue
+      }
       rows.append(line)
       previousWasBlank = false
     }
@@ -283,6 +297,33 @@ private struct TerminalTranscriptRenderer {
     guard line.count >= 18 else { return false }
     let ruleCharacters = CharacterSet(charactersIn: "-_─━═=╌┄┈…·. ")
     return line.unicodeScalars.allSatisfy { ruleCharacters.contains($0) }
+  }
+
+  private func isDuplicatePromptLine(current: String, previous: String) -> Bool {
+    guard let currentSignature = promptSignature(current),
+      let previousSignature = promptSignature(previous)
+    else { return false }
+    return currentSignature == previousSignature
+  }
+
+  private func promptSignature(_ line: String) -> String? {
+    let plain = stripANSI(line)
+      .replacingOccurrences(of: "\u{00a0}", with: " ")
+      .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+      .trimmed
+    guard plain.hasPrefix("❯ ") || plain.hasPrefix("➜ ") || plain.hasPrefix("> ")
+      || plain.hasPrefix("› ")
+    else { return nil }
+    let withoutPrompt =
+      plain
+      .replacingOccurrences(of: #"^[❯➜>›]\s*"#, with: "", options: .regularExpression)
+      .replacingOccurrences(
+        of: #"\b[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?\s*(?:AM|PM)?\b"#,
+        with: "",
+        options: .regularExpression
+      )
+      .trimmed
+    return withoutPrompt.isEmpty ? nil : withoutPrompt
   }
 
   private func compactPromptLines(_ value: String) -> String {
