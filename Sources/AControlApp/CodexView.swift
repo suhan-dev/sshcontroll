@@ -218,9 +218,15 @@ struct CodexView: View {
               model.codexWorkingStartedAtBySession[$0]
             },
             modelName: "\(model.codexModel) \(model.codexReasoningEffort)",
+            fiveHour: model.codexToken5h,
             weekly: model.codexTokenWeekly,
             reset: model.codexTokenReset,
-            style: .codexActivity
+            style: .codexActivity,
+            canLoadMoreTranscript: model.codexTranscriptCanLoadMore,
+            isLoadingMoreTranscript: model.isLoadingMoreCodexTranscript,
+            loadMoreTranscript: {
+              Task { await model.loadMoreCodexTranscript() }
+            }
           ) {
             Task { await model.refreshCodexTokenStatus(force: true) }
           }
@@ -2499,6 +2505,7 @@ struct CodexTranscriptCard: View {
   var isWorking = false
   var workingSince: Date?
   var modelName: String
+  var fiveHour: String
   var weekly: String
   var reset: String
   var symbol = "sparkles"
@@ -2506,6 +2513,9 @@ struct CodexTranscriptCard: View {
   var placeholder = "Codex transcript will appear here."
   var showsWeeklyStatus = true
   var style: TranscriptStyle = .raw
+  var canLoadMoreTranscript = false
+  var isLoadingMoreTranscript = false
+  var loadMoreTranscript: () -> Void = {}
   var refreshTokens: () -> Void
 
   private var effectiveScheme: ColorScheme {
@@ -2535,6 +2545,25 @@ struct CodexTranscriptCard: View {
       return "Working for \(seconds)s"
     }
     return "Working for \(seconds / 60)m \(seconds % 60)s"
+  }
+
+  private var tokenSummary: String {
+    let fiveHourValue = fiveHour.isEmpty || fiveHour == "Tap Tokens" ? "Tap" : fiveHour
+    let weeklyValue = weekly.isEmpty || weekly == "Tap Tokens" ? "Tap" : weekly
+    let base = "5h \(fiveHourValue) · Weekly \(weeklyValue)"
+    guard let resetSummary = tokenResetSummary else { return base }
+    return "\(base) · \(resetSummary)"
+  }
+
+  private var tokenResetSummary: String? {
+    let clean = reset
+      .replacingOccurrences(of: "5hr resets", with: "5h resets")
+      .replacingOccurrences(of: "Token status unavailable ·", with: "")
+      .trimmed
+    guard !clean.isEmpty else { return nil }
+    let lower = clean.lowercased()
+    guard lower.contains("reset") || lower.contains("resets") else { return nil }
+    return clean
   }
 
   var body: some View {
@@ -2613,7 +2642,9 @@ struct CodexTranscriptCard: View {
           Button(action: refreshTokens) {
             HStack(spacing: 6) {
               Image(systemName: "gauge.with.dots.needle.67percent")
-              Text("Weekly \(weekly.isEmpty ? "Tap" : weekly)")
+              Text(tokenSummary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.82)
             }
             .font(.caption.weight(.bold))
             .foregroundStyle(AControlStyle.accentForeground(.cyan, colorScheme))
@@ -2740,6 +2771,9 @@ struct CodexTranscriptCard: View {
         scrollSignal: scrollSignal,
         followTailSignal: followTailSignal,
         userIsReadingHistory: userHasScrolledAway,
+        canLoadMore: canLoadMoreTranscript,
+        isLoadingMore: isLoadingMoreTranscript,
+        loadMore: loadMoreTranscript,
         onBottomStateChange: { visible, distance in
           transcriptAtBottom = visible
           transcriptDistanceToBottom = distance
@@ -2934,6 +2968,9 @@ struct CodexActivityTranscriptView: View {
   var scrollSignal: Int
   var followTailSignal: Int
   var userIsReadingHistory = false
+  var canLoadMore = false
+  var isLoadingMore = false
+  var loadMore: () -> Void = {}
   var onBottomStateChange: ((Bool, CGFloat) -> Void)?
   var usesPanelChrome = true
   @State private var isAtBottom = true
@@ -2985,7 +3022,39 @@ struct CodexActivityTranscriptView: View {
   var body: some View {
     ScrollViewReader { proxy in
       ScrollView {
-        VStack(alignment: .leading, spacing: 9) {
+        LazyVStack(alignment: .leading, spacing: 9) {
+          if canLoadMore {
+            HStack {
+              Spacer(minLength: 0)
+              Button(action: loadMore) {
+                HStack(spacing: 7) {
+                  if isLoadingMore {
+                    ProgressView()
+                      .scaleEffect(0.68)
+                      .controlSize(.small)
+                  } else {
+                    Image(systemName: "clock.arrow.circlepath")
+                  }
+                  Text(isLoadingMore ? "Loading older transcript" : "Load older transcript")
+                }
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(AControlStyle.accentForeground(.blue, colorScheme))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(AControlStyle.accentFill(.blue, colorScheme), in: Capsule())
+                .overlay {
+                  Capsule()
+                    .strokeBorder(AControlStyle.accentStroke(.blue, colorScheme), lineWidth: 1)
+                }
+              }
+              .buttonStyle(ImmediateFeedbackButtonStyle())
+              .disabled(isLoadingMore)
+              .safeHelp("Fetch an older Codex transcript window without moving the current scroll position.")
+              Spacer(minLength: 0)
+            }
+            .padding(.bottom, 4)
+            .id("codex-load-older")
+          }
           ForEach(displayItems) { item in
             CodexActivityRow(item: item, expandedTextIDs: $expandedTextIDs)
               .id(item.id)
@@ -3362,7 +3431,7 @@ private struct CodexActivityRow: View {
             font: .system(size: 12.0, weight: .regular, design: item.kind.prefersMonospace ? .monospaced : .default),
             color: .secondary.opacity(0.86),
             collapsedLineLimit: item.kind.prefersMonospace ? 8 : 6,
-            fileReferences: item.fileReferences,
+            fileReferences: [],
             expandedTextIDs: $expandedTextIDs
           ) { reference in
             preview(reference, openingPanel: true)
@@ -3371,7 +3440,9 @@ private struct CodexActivityRow: View {
           }
         }
 
-        fileReferenceSection
+        if item.kind.showsFileReferences {
+          fileReferenceSection
+        }
       }
       .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -3428,7 +3499,7 @@ private struct CodexActivityRow: View {
           }
         }
       }
-      if !hasInlineFileHeading {
+      if item.kind.showsFileReferences && !hasInlineFileHeading {
         fileReferenceSection
       }
     }
@@ -4117,9 +4188,20 @@ private enum CodexActivityKind: Sendable, Equatable {
       false
     }
   }
+
+  var showsFileReferences: Bool {
+    switch self {
+    case .ran, .explored, .edited, .called, .waited:
+      false
+    default:
+      true
+    }
+  }
 }
 
 private enum CodexActivityParser {
+  private static let maxParsedCharacters = 72_000_000
+
   static func items(from rawText: String, isPlaceholder: Bool) -> [CodexActivityItem] {
     if isPlaceholder {
       return [CodexActivityItem(kind: .placeholder, title: rawText, detail: "", badge: nil)]
@@ -4146,7 +4228,7 @@ private enum CodexActivityParser {
       )
     )
     if !parsed.isEmpty {
-      return Array(parsed.suffix(120))
+      return parsed
     }
     let fallback = fallbackItems(from: cleaned)
     if !fallback.isEmpty {
@@ -4156,8 +4238,8 @@ private enum CodexActivityParser {
   }
 
   private static func recentSlice(_ value: String) -> String {
-    guard value.count > 180_000 else { return value }
-    return String(value.suffix(180_000))
+    guard value.count > maxParsedCharacters else { return value }
+    return String(value.suffix(maxParsedCharacters))
   }
 
   private static func normalizedLine(_ line: String) -> String {
@@ -4189,6 +4271,8 @@ private enum CodexActivityParser {
       .lowercased()
     return lower.contains("openai codex") || lower.contains("development features are incomplete")
       || lower.hasPrefix("model:") || lower.hasPrefix("directory:") || lower.hasPrefix("tip:")
+      || lower.hasPrefix("codex history:") || lower.hasPrefix("latest_user:")
+      || lower.hasPrefix("transcript_window:")
       || lower == "/status" || lower.hasPrefix("visit https://chatgpt.com/codex/settings/usage")
       || lower.hasPrefix("information on rate limits") || lower.hasPrefix("permissions:")
       || lower.hasPrefix("agents.md:") || lower.hasPrefix("account:")

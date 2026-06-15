@@ -2434,6 +2434,10 @@ paste_stdin_and_enter() {
       echo "Codex input was not ready for session $target. The prompt was not pasted." >&2
       exit 70
     fi
+    pane_text="$(tmux capture-pane -pJ -t "$target" -S -30 2>/dev/null || true)"
+    if codex_queue_pane_is_busy "$pane_text"; then
+      busy=1
+    fi
   fi
 
   if { [[ "$mode" == "codex" && "$busy" != "1" ]]; } || [[ "$mode" == "claude" ]]; then
@@ -2646,12 +2650,22 @@ codex_queue_pane_needs_recovery() {
     || "$lower" == *"reconnecting..."* ]]
 }
 
+codex_queue_state_tail() {
+  print -r -- "$1" \
+    | perl -CS -pe 's/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\r/\n/g' 2>/dev/null \
+    | tail -50
+}
+
 codex_queue_pane_is_busy() {
   local pane_text="$1"
-  local lower
-  lower="$(print -r -- "$pane_text" | tr '[:upper:]' '[:lower:]')"
-  [[ "$lower" == *"working"* \
-    || "$lower" == *"thinking"* \
+  local tail lower
+  tail="$(codex_queue_state_tail "$pane_text")"
+  lower="$(print -r -- "$tail" | tr '[:upper:]' '[:lower:]')"
+  [[ "$lower" == *"working for"* \
+    || "$lower" == *"working ("* \
+    || "$lower" == *"• working"* \
+    || "$lower" == *" thinking"* \
+    || "$lower" == *$'\n'"thinking"* \
     || "$lower" == *"esc to interrupt"* \
     || "$lower" == *"tab to queue message"* \
     || "$lower" == *"작업 중"* \
@@ -3693,7 +3707,7 @@ codex_token_status() {
     sleep 2.4
     pane_text="$(capture_session "$token_session" 2>/dev/null || true)"
     lower="$(print -r -- "$pane_text" | tr '[:upper:]' '[:lower:]')"
-    if [[ "$lower" == *"weekly limit:"* || "$lower" == *"less than"* ]]; then
+    if [[ "$lower" == *"5h limit:"* || "$lower" == *"weekly limit:"* || "$lower" == *"less than"* ]]; then
       print -r -- "$pane_text" > "$CODEX_TOKEN_STATUS_CACHE" 2>/dev/null || true
       print -r -- "$pane_text"
       return 0
@@ -5371,6 +5385,25 @@ def is_automation_meta(*values):
     normalized = [str(value or "").strip().lower() for value in values]
     return any(value == "automation" for value in normalized) or is_automation_text(*values)
 
+def pane_state_tail(text, max_lines=50):
+    cleaned = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", str(text or ""))
+    return "\n".join(cleaned.replace("\r", "\n").splitlines()[-max_lines:])
+
+def pane_looks_busy(text):
+    tail = pane_state_tail(text)
+    lower = tail.lower()
+    if any(marker in lower for marker in [
+        "working for",
+        "working (",
+        "• working",
+        "esc to interrupt",
+        "tab to queue message",
+        "작업 중",
+        "진행 중",
+    ]):
+        return True
+    return any(line.strip().lower().startswith("thinking") for line in tail.splitlines())
+
 try:
     tmux = subprocess.run(
         ["tmux", "list-panes", "-a", "-F", "#{session_name}:#{pane_current_path}:#{pane_current_command}:#{pane_id}"],
@@ -5395,25 +5428,11 @@ try:
                 timeout=1.2,
             )
             pane_text = capture.stdout if capture.returncode == 0 else ""
-            lower = pane_text.lower()
             id_match = re.search(r"codex_history_id:\s*([0-9a-f-]{16,})", pane_text, re.I)
             if not id_match:
                 id_match = re.search(r"\bsession:\s*([0-9a-f-]{16,})", pane_text, re.I)
-            working_marker = max(
-                lower.rfind("• working"),
-                lower.rfind("working ("),
-                lower.rfind("working for"),
-                lower.rfind("thinking"),
-                lower.rfind("esc to interrupt"),
-            )
-            done_marker = max(
-                lower.rfind("process exited with code"),
-                lower.rfind("final answer"),
-                lower.rfind("checks run"),
-                lower.rfind("implemented"),
-            )
             status = {
-                "working": working_marker >= 0 and working_marker > done_marker,
+                "working": pane_looks_busy(pane_text),
                 "tmux": True,
                 "session_name": session_name,
                 "cwd": pane_cwd,
@@ -5957,6 +5976,16 @@ def function_call_summary(source):
     if not name:
         return ""
     args = parsed_json_argument(source.get("arguments"))
+    if name == "create_goal":
+        objective = compact_one_line(args.get("objective") or "", limit=140)
+        budget = str(args.get("token_budget") or "").strip()
+        suffix = f" · budget {budget}" if budget else ""
+        return f"Goal: {objective or 'Pursuing goal'}{suffix}"
+    if name == "update_goal":
+        status = compact_one_line(args.get("status") or "", limit=80)
+        return f"Goal: {status or 'updated'}"
+    if name == "get_goal":
+        return "Goal: checked current goal"
     if name == "exec_command":
         cmd = str(args.get("cmd") or "").strip()
         workdir = str(args.get("workdir") or "").strip()
@@ -5974,8 +6003,6 @@ def function_call_summary(source):
         reader = re.search(r"(^|[\s;|&])(rg|sed|cat|find|ls|tail|head|wc|nl|stat|file)\b", head)
         label = "Explored" if reader else "Ran"
         detail = compact_one_line(head)
-        if workdir and workdir not in detail:
-            detail = f"{detail}\n{workdir}"
         return f"• {label} {detail}"
     if name == "view_image":
         path = str(args.get("path") or "").strip()
@@ -6094,7 +6121,7 @@ if transcript_truncated:
 if header:
     print("\n".join(header))
     print("")
-print("\n\n".join(rows[-240:]))
+print("\n\n".join(rows))
 PY
 }
 

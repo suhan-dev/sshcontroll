@@ -26,6 +26,8 @@ private struct CodexAQueueBatchJob: Encodable {
 final class AppModel: ObservableObject {
   private static let deliveredCodexQueueRetentionSeconds: TimeInterval = 6 * 60 * 60
   private static let deliveredResearchQueueRetentionSeconds: TimeInterval = 72 * 60 * 60
+  private static let defaultCodexTranscriptTailBytes = 4 * 1024 * 1024
+  private static let maxCodexTranscriptTailBytes = 64 * 1024 * 1024
 
   private static let fileSizeFormatter: ByteCountFormatter = {
     let formatter = ByteCountFormatter()
@@ -79,6 +81,8 @@ final class AppModel: ObservableObject {
   @Published var codexReasoningEffort = "xhigh"
   @Published var codexTranscriptCheckedAt: Date?
   @Published var codexTranscriptUpdatedAt: Date?
+  @Published var codexTranscriptCanLoadMore = false
+  @Published var isLoadingMoreCodexTranscript = false
   @Published var codexToken5h = "Tap Tokens"
   @Published var codexTokenWeekly = "Tap Tokens"
   @Published var codexTokenReset = "Codex /status has not been read yet."
@@ -182,6 +186,7 @@ final class AppModel: ObservableObject {
   private var lastCodexTokenRefresh = Date.distantPast
   private var lastVisibleArtifactPrewarm = Date.distantPast
   private var isRefreshingCodexTokens = false
+  private var codexTranscriptTailBytesByHistoryID: [String: Int] = [:]
   private var pendingCodexLocalTurnBlocksBySession: [UUID: [String]] = [:]
   private var codexDeliveredQueueBlocksBySession: [UUID: [String]] = [:]
   private var codexDraftsBySession: [UUID: String] = [:]
@@ -565,6 +570,8 @@ final class AppModel: ObservableObject {
   }
 
   private func loadCachedTranscriptsForActiveSession() {
+    codexTranscriptCanLoadMore = false
+    isLoadingMoreCodexTranscript = false
     guard activeSessionID != nil else {
       setCodexTranscript("", force: true)
       setClaudeTranscript("", force: true)
@@ -1540,6 +1547,8 @@ final class AppModel: ObservableObject {
     codexArtifactPreviewKind = .none
     isCodexArtifactPreviewLoading = false
     codexArtifactPreviewError = ""
+    codexTranscriptCanLoadMore = false
+    isLoadingMoreCodexTranscript = false
     codexModel = "gpt-5.5"
   }
 
@@ -3150,6 +3159,7 @@ final class AppModel: ObservableObject {
     if let record = activeCodexHistoryRecord() {
       let historyResult = await codexHistoryTranscriptResult(for: record)
       if historyResult.exitCode == 0, !historyResult.output.trimmed.isEmpty {
+        updateCodexTranscriptWindowState(from: historyResult.output, record: record)
         applyCodexTranscriptResult(historyResult)
         return
       }
@@ -4318,6 +4328,7 @@ final class AppModel: ObservableObject {
   private func loadCodexHistoryTranscript(_ record: CodexHistoryRecord) async {
     let result = await codexHistoryTranscriptResult(for: record)
     guard result.exitCode == 0, !result.output.trimmed.isEmpty else { return }
+    updateCodexTranscriptWindowState(from: result.output, record: record)
     let mergedInput = codexTranscriptPreservingLocalTurns(result.output)
     let merged = persistTranscript(.codex, value: mergedInput)
     updateActiveCodexWorkingState(from: result.output, mayStart: true)
@@ -4325,18 +4336,58 @@ final class AppModel: ObservableObject {
     scheduleCodexTranscriptAnalysis()
   }
 
-  private func codexHistoryTranscriptResult(for record: CodexHistoryRecord) async -> CommandResult {
+  func loadMoreCodexTranscript() async {
+    guard !isLoadingMoreCodexTranscript, let record = activeCodexHistoryRecord() else { return }
+    let historyID = record.id.trimmed
+    guard !historyID.isEmpty else { return }
+    let currentBytes =
+      codexTranscriptTailBytesByHistoryID[historyID] ?? Self.defaultCodexTranscriptTailBytes
+    let nextBytes = min(
+      max(currentBytes * 2, Self.defaultCodexTranscriptTailBytes * 2),
+      Self.maxCodexTranscriptTailBytes
+    )
+    guard nextBytes > currentBytes || codexTranscriptCanLoadMore else { return }
+    isLoadingMoreCodexTranscript = true
+    statusText = "Loading older transcript · \(Date().shortStamp)"
+    defer { isLoadingMoreCodexTranscript = false }
+    let result = await codexHistoryTranscriptResult(for: record, tailBytes: nextBytes)
+    guard result.exitCode == 0, !result.output.trimmed.isEmpty else {
+      statusText = "Older transcript unavailable · \(Date().shortStamp)"
+      return
+    }
+    codexTranscriptTailBytesByHistoryID[historyID] = nextBytes
+    updateCodexTranscriptWindowState(from: result.output, record: record, tailBytes: nextBytes)
+    let mergedInput = codexTranscriptPreservingLocalTurns(result.output)
+    let merged = persistTranscript(.codex, value: mergedInput)
+    updateActiveCodexWorkingState(from: result.output, mayStart: true)
+    if setCodexTranscript(merged, force: true) {
+      scheduleCodexTranscriptAnalysis()
+    }
+    statusText = "Older transcript loaded · \(Date().shortStamp)"
+  }
+
+  private func codexHistoryTranscriptResult(
+    for record: CodexHistoryRecord,
+    tailBytes: Int? = nil
+  ) async -> CommandResult {
+    var environment: [String: String] = [:]
+    if let tailBytes {
+      environment["A_COCKPIT_CODEX_TRANSCRIPT_TAIL_BYTES"] =
+        "\(min(max(tailBytes, 1_048_576), Self.maxCodexTranscriptTailBytes))"
+    }
     if record.normalizedHost == "local" {
       return await runLocalHelper(
         "codex-history-transcript",
         args: [record.id],
         input: record.path + "\n",
-        timeout: 60
+        timeout: 60,
+        environment: environment
       )
     }
     return await runRemote(
       "codex-history-transcript", args: [record.id], input: record.path + "\n", timeout: 60,
-      showsActivity: false)
+      showsActivity: false,
+      environmentOverride: environment.isEmpty ? nil : environment)
   }
 
   private func codexHistoryTranscriptBackgroundResult(for record: CodexHistoryRecord) async
@@ -4352,6 +4403,27 @@ final class AppModel: ObservableObject {
     }
     return await runRemoteBackground(
       "codex-history-transcript", args: [record.id], input: record.path + "\n", timeout: 16)
+  }
+
+  private func updateCodexTranscriptWindowState(
+    from transcript: String,
+    record: CodexHistoryRecord,
+    tailBytes: Int? = nil
+  ) {
+    let historyID = record.id.trimmed
+    guard !historyID.isEmpty else {
+      codexTranscriptCanLoadMore = false
+      return
+    }
+    if let tailBytes {
+      codexTranscriptTailBytesByHistoryID[historyID] = tailBytes
+    } else if codexTranscriptTailBytesByHistoryID[historyID] == nil {
+      codexTranscriptTailBytesByHistoryID[historyID] = Self.defaultCodexTranscriptTailBytes
+    }
+    let currentBytes =
+      codexTranscriptTailBytesByHistoryID[historyID] ?? Self.defaultCodexTranscriptTailBytes
+    let isWindowed = transcript.contains("transcript_window: last ")
+    codexTranscriptCanLoadMore = isWindowed && currentBytes < Self.maxCodexTranscriptTailBytes
   }
 
   private func shouldReplaceWithCodexHistoryTranscript(_ record: CodexHistoryRecord) -> Bool {

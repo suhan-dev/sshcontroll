@@ -23,6 +23,7 @@ struct ClaudeView: View {
         text: model.claudeTranscript,
         sessionID: model.activeSessionID,
         modelName: "Claude Code",
+        fiveHour: "",
         weekly: "",
         reset: "",
         symbol: "text.bubble",
