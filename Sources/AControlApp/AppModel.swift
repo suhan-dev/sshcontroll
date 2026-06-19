@@ -1854,7 +1854,7 @@ final class AppModel: ObservableObject {
     if !displayTitle.isEmpty {
       sessions[index].codexHistoryTitle = displayTitle
       if sessions[index].nameSource == .codexApp {
-        sessions[index].name = displayTitle
+        sessions[index].name = stableCodexSessionName(id: trimmedID, cwd: sessions[index].remoteDir)
       }
     }
     sessions[index].codexState = .linked
@@ -1893,7 +1893,7 @@ final class AppModel: ObservableObject {
     if !displayTitle.isEmpty {
       sessions[index].codexHistoryTitle = displayTitle
       if sessions[index].nameSource == .codexApp {
-        sessions[index].name = displayTitle
+        sessions[index].name = stableCodexSessionName(id: trimmedID, cwd: sessions[index].remoteDir)
       }
     }
     sessions[index].codexState = .linked
@@ -1930,12 +1930,17 @@ final class AppModel: ObservableObject {
         sessions[index].codexHistoryTitle = nextTitle
         changed = true
       }
+      let stableName = stableCodexSessionName(
+        id: sessions[index].codexHistoryID,
+        cwd: sessions[index].remoteDir
+      )
       let importedOrNoisy =
         sessions[index].nameSource == .codexApp
-        || (!sessions[index].codexHistoryID.trimmed.isEmpty
+        || (sessions[index].nameSource == .generated
+          && !sessions[index].codexHistoryID.trimmed.isEmpty
           && cleanCodexHistoryTitle(sessions[index].name) == nil)
-      if importedOrNoisy && sessions[index].name != nextTitle {
-        sessions[index].name = nextTitle
+      if importedOrNoisy && sessions[index].name != stableName {
+        sessions[index].name = stableName
         sessions[index].nameSource = .codexApp
         changed = true
       } else if importedOrNoisy && sessions[index].nameSource != .codexApp {
@@ -1965,6 +1970,10 @@ final class AppModel: ObservableObject {
     if let title = cleanCodexHistoryTitle(rawTitle) {
       return title
     }
+    return stableCodexSessionName(id: id, cwd: cwd)
+  }
+
+  private func stableCodexSessionName(id: String, cwd: String) -> String {
     let folder = URL(fileURLWithPath: cwd.expandingTilde).lastPathComponent.trimmed
     let prefix = folder.isEmpty ? "Codex" : folder
     let short = id.trimmed.isEmpty ? "" : " \(String(id.trimmed.prefix(8)))"
@@ -3299,7 +3308,10 @@ final class AppModel: ObservableObject {
         if sessions[index].codexHistoryTitle != title {
           sessions[index].codexHistoryTitle = title
           if sessions[index].nameSource == .codexApp {
-            sessions[index].name = title
+            sessions[index].name = stableCodexSessionName(
+              id: sessions[index].codexHistoryID,
+              cwd: sessions[index].remoteDir
+            )
           }
           changed = true
         }
@@ -3575,7 +3587,8 @@ final class AppModel: ObservableObject {
           continue
         }
         let title = titleForCodexRecord(record)
-        var session = SessionCard(name: title, remoteDir: remoteDir, tool: .codex)
+        let sessionName = stableCodexSessionName(id: historyID, cwd: remoteDir)
+        var session = SessionCard(name: sessionName, remoteDir: remoteDir, tool: .codex)
         session.codexHistoryID = historyID
         session.codexHistoryPath = record.path
         session.codexHistoryTitle = title

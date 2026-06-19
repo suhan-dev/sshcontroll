@@ -39,6 +39,7 @@ Environment:
   SSHCONTROLL_BUNDLE_IDENTIFIER=dev.suhan.sshcontroll
   SSHCONTROLL_EXECUTABLE_NAME=SSHcontroll
   SSHCONTROLL_INSTALL_PATH=/Applications/SSHcontroll.app
+  SSHCONTROLL_SCRATCH_PATH=/private/tmp/sshcontroll-build
 HELP
       exit 0
       ;;
@@ -52,10 +53,15 @@ done
 
 CPU_COUNT="$(sysctl -n hw.activecpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || printf '4')"
 JOBS="${SSHCONTROLL_JOBS:-${ACONTROL_JOBS:-$CPU_COUNT}}"
-swift build -c "$CONFIG" -j "$JOBS"
+SCRATCH_PATH="${SSHCONTROLL_SCRATCH_PATH:-${ACONTROL_SCRATCH_PATH:-}}"
+SWIFT_BUILD_ARGS=(-c "$CONFIG")
+if [[ -n "$SCRATCH_PATH" ]]; then
+  SWIFT_BUILD_ARGS+=(--scratch-path "$SCRATCH_PATH")
+fi
+swift build "${SWIFT_BUILD_ARGS[@]}" -j "$JOBS"
 
 APP="$ROOT/.build/$APP_NAME.app"
-BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
+BIN_DIR="$(swift build "${SWIFT_BUILD_ARGS[@]}" --show-bin-path)"
 BIN="$BIN_DIR/$EXECUTABLE_NAME"
 ICONSET="$ROOT/Resources/AControl.iconset"
 ICON="$ROOT/Resources/AControl.icns"
