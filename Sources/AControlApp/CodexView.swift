@@ -2714,11 +2714,10 @@ struct CodexTranscriptCard: View {
         transcriptDistanceToBottom = 0
         DispatchQueue.main.async {
           scrollSignal += 1
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) {
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) {
             transcriptAtBottom = true
             transcriptDistanceToBottom = 0
             scrollButtonSuppressed = false
-            scrollSignal += 1
           }
         }
       }
@@ -2974,6 +2973,8 @@ struct CodexActivityTranscriptView: View {
   var onBottomStateChange: ((Bool, CGFloat) -> Void)?
   var usesPanelChrome = true
   @State private var isAtBottom = true
+  @State private var pendingAutoScrollTask: Task<Void, Never>?
+  @State private var lastAutoScrollAt = Date.distantPast
   @State private var parsedItems: [CodexActivityItem] = []
   @State private var expandedTextIDs: Set<String> = []
 
@@ -3099,17 +3100,13 @@ struct CodexActivityTranscriptView: View {
         y: usesPanelChrome ? 4 : 0
       )
       .onChange(of: scrollSignal) { _, _ in
-        scrollToBottom(proxy, force: true, notify: true, extraDelays: [0.08])
+        scheduleScrollToBottom(proxy, force: true, notify: true, delay: 15_000_000)
       }
       .onChange(of: followTailSignal) { _, _ in
-        DispatchQueue.main.async {
-          scrollToBottom(proxy, force: false, extraDelays: [0.06])
-        }
+        scheduleScrollToBottom(proxy, force: false, delay: 70_000_000)
       }
       .onAppear {
-        DispatchQueue.main.async {
-          scrollToBottom(proxy, force: true, extraDelays: [0.05, 0.18])
-        }
+        scheduleScrollToBottom(proxy, force: true, delay: 90_000_000)
       }
       .task(id: parseKey) {
         try? await Task.sleep(nanoseconds: 20_000_000)
@@ -3126,9 +3123,7 @@ struct CodexActivityTranscriptView: View {
         let shouldKeepPinned = canFollowTail
         parsedItems = nextItems
         if shouldKeepPinned {
-          DispatchQueue.main.async {
-            scrollToBottom(proxy, force: false, extraDelays: [0.06])
-          }
+          scheduleScrollToBottom(proxy, force: false, delay: 50_000_000)
         }
       }
     }
@@ -3138,26 +3133,37 @@ struct CodexActivityTranscriptView: View {
     !userIsReadingHistory && isAtBottom
   }
 
-  private func scrollToBottom(
+  private func scheduleScrollToBottom(
     _ proxy: ScrollViewProxy,
     force: Bool,
     notify: Bool = false,
-    extraDelays: [TimeInterval] = []
+    delay: UInt64
+  ) {
+    pendingAutoScrollTask?.cancel()
+    pendingAutoScrollTask = Task { @MainActor in
+      if delay > 0 {
+        try? await Task.sleep(nanoseconds: delay)
+      }
+      guard !Task.isCancelled else { return }
+      scrollToBottom(proxy, force: force, notify: notify)
+    }
+  }
+
+  private func scrollToBottom(
+    _ proxy: ScrollViewProxy,
+    force: Bool,
+    notify: Bool = false
   ) {
     guard force || canFollowTail else { return }
+    let now = Date()
+    if !force, now.timeIntervalSince(lastAutoScrollAt) < 0.16 {
+      return
+    }
+    lastAutoScrollAt = now
     proxy.scrollTo("codex-bottom", anchor: .bottom)
     if notify {
       isAtBottom = true
       onBottomStateChange?(true, 0)
-    }
-    for delay in extraDelays {
-      DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-        guard force || canFollowTail else { return }
-        proxy.scrollTo("codex-bottom", anchor: .bottom)
-        if notify {
-          onBottomStateChange?(true, 0)
-        }
-      }
     }
   }
 }
@@ -3510,8 +3516,11 @@ private struct CodexActivityRow: View {
     if !item.fileReferences.isEmpty {
       let imageReferences = item.fileReferences.filter(\.isImage)
       if !imageReferences.isEmpty {
-        VStack(alignment: .leading, spacing: 7) {
-          ForEach(imageReferences.prefix(4)) { reference in
+        let columns = [
+          GridItem(.adaptive(minimum: 180, maximum: 280), spacing: 8, alignment: .top)
+        ]
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 8) {
+          ForEach(imageReferences.prefix(8)) { reference in
             CodexInlineImagePreview(reference: reference, context: fileReferenceContext) {
               preview(reference, openingPanel: true)
             }
@@ -4033,8 +4042,8 @@ private struct CodexInlineImagePreview: View {
           .padding(.horizontal, 12)
         }
       }
-      .frame(maxWidth: 430)
-      .frame(minHeight: 128, idealHeight: 180, maxHeight: 220)
+      .frame(maxWidth: .infinity)
+      .frame(minHeight: 128, idealHeight: 176, maxHeight: 220)
       .overlay {
         RoundedRectangle(cornerRadius: 8, style: .continuous)
           .strokeBorder(AControlStyle.hairline(colorScheme), lineWidth: 1)
@@ -5567,7 +5576,7 @@ private enum CodexActivityParser {
       add(path: candidate)
     }
 
-    return Array(references.prefix(12))
+    return Array(references.prefix(20))
   }
 
   private static func fileReferenceCandidateLine(_ value: String) -> String {

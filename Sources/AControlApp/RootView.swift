@@ -109,7 +109,7 @@ struct RootView: View {
       .padding(.horizontal, 10)
 
       VStack(alignment: .leading, spacing: 8) {
-        Text("A Sessions")
+        Text("Sessions")
           .font(.caption.weight(.bold))
           .foregroundStyle(.secondary)
           .padding(.horizontal, 14)

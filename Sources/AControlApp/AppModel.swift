@@ -652,22 +652,7 @@ final class AppModel: ObservableObject {
   }
 
   private func codexQueueOverlay(for sessionID: UUID?) -> String {
-    let relevant = codexPromptQueue.filter { item in
-      guard item.isVisibleInComposerQueue else { return false }
-      guard let sessionID else { return true }
-      return item.sessionID == sessionID
-    }
-    guard !relevant.isEmpty else { return "" }
-    return
-      relevant
-      .sorted { first, second in
-        if first.status != second.status {
-          return queueStatusRank(first.status) < queueStatusRank(second.status)
-        }
-        return first.createdAt < second.createdAt
-      }
-      .map { item in codexQueueBlock(for: item, includeStatus: true) }
-      .joined(separator: "\n\n")
+    ""
   }
 
   private func queueStatusRank(_ status: CodexPromptQueueStatus) -> Int {
@@ -686,7 +671,7 @@ final class AppModel: ObservableObject {
       case .send:
         return ["› \(item.visibleText)"].filter { !$0.trimmed.isEmpty }.joined(separator: "\n")
       case .steer:
-        return ["Steered conversation", item.visibleText]
+        return ["› \(item.visibleText)", "Steered conversation"]
           .filter { !$0.trimmed.isEmpty }
           .joined(separator: "\n")
       }
@@ -1965,7 +1950,7 @@ final class AppModel: ObservableObject {
       }
     }
     if changed {
-      sessions.sort { first, second in first.updatedAt > second.updatedAt }
+      sortSessionsByRecent()
       if shouldSave {
         saveSessions()
       }
@@ -2227,11 +2212,25 @@ final class AppModel: ObservableObject {
   }
 
   private func sortSessionsByRecent() {
+    let originalIndex = Dictionary(uniqueKeysWithValues: sessions.enumerated().map { index, session in
+      (session.id, index)
+    })
     sessions.sort { first, second in
+      let firstWorking = codexWorkingSessionIDs.contains(first.id)
+        || claudeWorkingSessionIDs.contains(first.id)
+      let secondWorking = codexWorkingSessionIDs.contains(second.id)
+        || claudeWorkingSessionIDs.contains(second.id)
+      if firstWorking && secondWorking {
+        return (originalIndex[first.id] ?? Int.max) < (originalIndex[second.id] ?? Int.max)
+      }
       if first.updatedAt != second.updatedAt {
         return first.updatedAt > second.updatedAt
       }
-      return first.name.localizedStandardCompare(second.name) == .orderedAscending
+      let nameOrder = first.name.localizedStandardCompare(second.name)
+      if nameOrder != .orderedSame {
+        return nameOrder == .orderedAscending
+      }
+      return first.id.uuidString < second.id.uuidString
     }
   }
 
@@ -3321,7 +3320,7 @@ final class AppModel: ObservableObject {
     changed = collapseDuplicateCodexHistorySessions() || changed
     changed = pruneNoisyImportedCodexSessions(save: false) || changed
     if changed {
-      sessions.sort { first, second in first.updatedAt > second.updatedAt }
+      sortSessionsByRecent()
       if activeSessionID == nil, let first = sessions.first {
         activeSessionID = first.id
         currentRemoteDir = first.remoteDir
@@ -3596,7 +3595,7 @@ final class AppModel: ObservableObject {
     changed = collapseDuplicateCodexHistorySessions() || changed
     changed = pruneNoisyImportedCodexSessions(save: false) || changed
     if changed {
-      sessions.sort { first, second in first.updatedAt > second.updatedAt }
+      sortSessionsByRecent()
       if activeSessionID == nil, let first = sessions.first {
         activeSessionID = first.id
         currentRemoteDir = first.remoteDir
@@ -3715,7 +3714,6 @@ final class AppModel: ObservableObject {
       next.contains(sessionID)
     }
     if sessionsChanged {
-      sessions.sort { first, second in first.updatedAt > second.updatedAt }
       saveSessions()
     }
     if next != codexWorkingSessionIDs {
@@ -3900,10 +3898,12 @@ final class AppModel: ObservableObject {
       text: text,
       displayText: displayText
     )
-    appendCodexLocalTurnBlock(
-      codexQueueBlock(for: visibleQueueItem(item), includeStatus: false),
-      preserveThroughCapture: true
-    )
+    if steer {
+      appendCodexLocalTurnBlock(
+        codexQueueBlock(for: visibleQueueItem(item), includeStatus: false),
+        preserveThroughCapture: true
+      )
+    }
     codexInput = ""
     codexAttachments.removeAll()
     statusText =
