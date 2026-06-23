@@ -4326,21 +4326,90 @@ state_db = home / ".codex" / "state_5.sqlite"
 if not state_db.exists():
     raise SystemExit(0)
 
+def semantic_title(value):
+    raw = str(value or "")
+    if not raw.strip():
+        return ""
+    text = raw.replace("&amp;", "&")
+    text = re.sub(r"</?input>", "\n", text, flags=re.I)
+    text = re.sub(r"</?codex_delegation>", "\n", text, flags=re.I)
+    text = re.sub(r"<source_thread_id>[^<]*</source_thread_id>", "\n", text, flags=re.I)
+    text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+
+    def finish(candidate):
+        clean = " ".join(str(candidate or "").split())
+        clean = clean.strip("`#*-: \t\r\n.")
+        clean = re.sub(r"\bworker\s+for\s+packet\s+", "", clean, flags=re.I)
+        clean = re.sub(r"\s+in\s+/Users/.*$", "", clean)
+        if not clean:
+            return ""
+        if len(clean) > 96:
+            clean = clean[:93].rstrip() + "..."
+        return clean
+
+    heading = re.search(r"^\s*#\s+([^#\n]{4,96})", raw, re.M)
+    if heading:
+        candidate = finish(heading.group(1))
+        lowered_candidate = candidate.lower()
+        if candidate and "no intermediate chat" not in lowered_candidate and "agents.md instructions" not in lowered_candidate:
+            return candidate
+
+    dispatch = re.search(
+        r"\bA0\s+dispatch\s+([A-Z]{1,4}-[0-9-]+|AQ[0-9]+).*?\bRole:\s*([^.\n<]{3,90})",
+        text,
+        re.I | re.S,
+    )
+    if dispatch:
+        role = finish(dispatch.group(2))
+        packet = finish(dispatch.group(1))
+        if role and packet:
+            return finish(f"{role} · {packet}")
+
+    role = re.search(r"\bRole:\s*([^.\n<]{3,96})", text, re.I)
+    if role:
+        return finish(role.group(1))
+
+    worker = re.search(r"\bYou\s+are\s+([^.\n]{3,96})", text, re.I)
+    if worker:
+        return finish(worker.group(1))
+
+    agent_packet = re.search(r"\b(A[0-9][A-Za-z0-9/ ]*)\s+(AQ[0-9]{3,5})\b", text)
+    if agent_packet:
+        return finish(f"{agent_packet.group(1)} · {agent_packet.group(2)}")
+
+    task = re.search(r"\bTask\s+([A-Z]{1,4}-[0-9-]+|AQ[0-9]+):\s*([^.\n]{6,96})", text, re.I)
+    if task:
+        return finish(f"{task.group(2)} · {task.group(1)}")
+
+    return ""
+
 def good_title(value):
     clean = " ".join(str(value or "").split())
     if not clean:
         return ""
     lower = clean.lower()
+    semantic = semantic_title(value)
+    if semantic and (
+        len(clean) > 120
+        or lower.startswith("<codex_delegation")
+        or lower.startswith("# no intermediate chat")
+        or " role:" in lower
+        or " a0 dispatch " in f" {lower} "
+    ):
+        return semantic
     blocked = (
         "<sshcontroll_attachments", "<environment_context", "{", "}",
         "subagent_notification", "process running with session id", "a_queue_",
         "codex_history_id:", "unable to locate image at",
         "steer the current codex work with this instruction",
         "basename:", "first line:", "smoke-test marker", "[@computer]",
+        "agents.md instructions",
     )
     if any(fragment in lower for fragment in blocked):
         return ""
     if re.match(r"^(cd(?:\s|$)|pwd(?:\s|$)|ls(?:\s|$)|clear$|/(status|model|permissions)\b)", clean, re.I):
+        return ""
+    if "/status" in lower and len(clean) < 40:
         return ""
     if re.match(r"^Stage\s+\d+\b.*\brole:", clean, re.I):
         return ""
@@ -4786,6 +4855,21 @@ scope = str(os.environ.get("A_COCKPIT_CODEX_HISTORY_SCOPE") or "directory").stri
 include_all = scope in {"all", "global", "home"} or str(os.environ.get("A_COCKPIT_CODEX_HISTORY_ALL") or "").strip().lower() in {
     "1", "true", "yes", "all"
 }
+try:
+    output_limit = int(os.environ.get("A_COCKPIT_CODEX_HISTORY_LIMIT") or ("1000" if include_all else "600"))
+except Exception:
+    output_limit = 1000 if include_all else 600
+output_limit = max(50, min(output_limit, 2000))
+try:
+    scan_limit = int(os.environ.get("A_COCKPIT_CODEX_HISTORY_SCAN_LIMIT") or ("1500" if include_all else "1000"))
+except Exception:
+    scan_limit = 1500 if include_all else 1000
+scan_limit = max(50, min(scan_limit, 4000))
+try:
+    scan_age_days = float(os.environ.get("A_COCKPIT_CODEX_HISTORY_MAX_AGE_DAYS") or "0")
+except Exception:
+    scan_age_days = 0
+scan_age_seconds = scan_age_days * 86400 if scan_age_days > 0 else 0
 
 base = pathlib.Path.home() / ".codex" / "sessions"
 sqlite_titles = {}
@@ -4820,11 +4904,77 @@ def repair_thread_visibility(conn):
     except Exception:
         pass
 
+def semantic_title(value):
+    raw = str(value or "")
+    if not raw.strip():
+        return ""
+    text = raw.replace("&amp;", "&")
+    text = re.sub(r"</?input>", "\n", text, flags=re.I)
+    text = re.sub(r"</?codex_delegation>", "\n", text, flags=re.I)
+    text = re.sub(r"<source_thread_id>[^<]*</source_thread_id>", "\n", text, flags=re.I)
+    text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+
+    def finish(candidate):
+        clean = " ".join(str(candidate or "").split())
+        clean = clean.strip("`#*-: \t\r\n.")
+        clean = re.sub(r"\bworker\s+for\s+packet\s+", "", clean, flags=re.I)
+        clean = re.sub(r"\s+in\s+/Users/.*$", "", clean)
+        if not clean:
+            return ""
+        if len(clean) > 110:
+            clean = clean[:107].rstrip() + "..."
+        return clean
+
+    heading = re.search(r"^\s*#\s+([^#\n]{4,110})", raw, re.M)
+    if heading:
+        candidate = finish(heading.group(1))
+        lowered_candidate = candidate.lower()
+        if candidate and "no intermediate chat" not in lowered_candidate and "agents.md instructions" not in lowered_candidate:
+            return candidate
+
+    dispatch = re.search(
+        r"\bA0\s+dispatch\s+([A-Z]{1,4}-[0-9-]+|AQ[0-9]+).*?\bRole:\s*([^.\n<]{3,100})",
+        text,
+        re.I | re.S,
+    )
+    if dispatch:
+        role = finish(dispatch.group(2))
+        packet = finish(dispatch.group(1))
+        if role and packet:
+            return finish(f"{role} · {packet}")
+
+    role = re.search(r"\bRole:\s*([^.\n<]{3,110})", text, re.I)
+    if role:
+        return finish(role.group(1))
+
+    worker = re.search(r"\bYou\s+are\s+([^.\n]{3,110})", text, re.I)
+    if worker:
+        return finish(worker.group(1))
+
+    agent_packet = re.search(r"\b(A[0-9][A-Za-z0-9/ ]*)\s+(AQ[0-9]{3,5})\b", text)
+    if agent_packet:
+        return finish(f"{agent_packet.group(1)} · {agent_packet.group(2)}")
+
+    task = re.search(r"\bTask\s+([A-Z]{1,4}-[0-9-]+|AQ[0-9]+):\s*([^.\n]{6,100})", text, re.I)
+    if task:
+        return finish(f"{task.group(2)} · {task.group(1)}")
+
+    return ""
+
 def good_title(value):
     clean = " ".join(str(value or "").split())
     if not clean or clean == "Codex session":
         return ""
     lower = clean.lower()
+    semantic = semantic_title(value)
+    if semantic and (
+        len(clean) > 120
+        or lower.startswith("<codex_delegation")
+        or lower.startswith("# no intermediate chat")
+        or " role:" in lower
+        or " a0 dispatch " in f" {lower} "
+    ):
+        return semantic
     blocked_fragments = (
         "<environment_context", "</environment_context", "<current_date>",
         "<timezone>", "<shell>", "<cwd>", "rollout_path=", "thread_id=",
@@ -4853,10 +5003,13 @@ def good_title(value):
             "first line:",
             "smoke-test marker",
             "[@computer]",
+            "agents.md instructions",
         )
     if any(fragment in lower for fragment in blocked_fragments):
         return ""
     if re.match(r"^(cd(?:\s|$)|pwd(?:\s|$)|ls(?:\s|$)|clear$|/(status|model|permissions)\b)", clean, re.I):
+        return ""
+    if re.match(r"^[A-Za-z0-9가-힣_ .-]{1,56}\s+[0-9a-f]{8}$", clean, re.I):
         return ""
     if re.match(r"^Stage\s+\d+\b.*\brole:", clean, re.I):
         return ""
@@ -4923,6 +5076,52 @@ def good_recent_title(value):
     if len(title) < 6:
         return ""
     return title
+
+def title_choice_score(value):
+    title = good_title(value)
+    if not title:
+        return 0
+    lower = title.lower()
+    score = 10
+    if (
+        lower.startswith("a0 ")
+        or lower.startswith("a0-")
+        or lower.startswith("a1")
+        or lower.startswith("a2")
+        or lower.startswith("a3")
+        or lower.startswith("a4")
+        or lower.startswith("a5")
+        or lower.startswith("a6")
+        or lower.startswith("a7")
+        or lower.startswith("a8")
+        or lower.startswith("a9")
+        or "central" in lower
+        or "coordinator" in lower
+        or "controller" in lower
+    ):
+        score += 7
+    if " aq" in f" {lower}" or "aq-" in lower:
+        score += 4
+    if "compact" in lower or "factory" in lower or "html" in lower or "report" in lower:
+        score += 3
+    if lower.startswith("codex running a bounded") or lower.startswith("codex running a daily"):
+        score -= 6
+    if "진행상황" in lower or "작업중" in lower or "보고" in lower:
+        score -= 3
+    if len(title) < 8:
+        score -= 4
+    return score
+
+def choose_best_title(*values):
+    best = ""
+    best_score = 0
+    for value in values:
+        title = good_title(value)
+        score = title_choice_score(title)
+        if score > best_score or (score == best_score and title and len(title) > len(best)):
+            best = title
+            best_score = score
+    return best
 
 def tail_lines(path, max_bytes=1048576):
     try:
@@ -5026,8 +5225,8 @@ if state_db.exists():
     try:
         with sqlite3.connect(str(state_db)) as conn:
             repair_thread_visibility(conn)
-            for session_id, cwd, title, rollout_path, source, thread_source, agent_role in conn.execute(
-                "select id, cwd, title, rollout_path, source, coalesce(thread_source,''), coalesce(agent_role,'') from threads"
+            for session_id, cwd, title, rollout_path, source, thread_source, agent_role, preview, first_user_message in conn.execute(
+                "select id, cwd, title, rollout_path, source, coalesce(thread_source,''), coalesce(agent_role,''), coalesce(preview,''), coalesce(first_user_message,'') from threads"
             ):
                 if not session_id:
                     continue
@@ -5052,10 +5251,24 @@ if state_db.exists():
                     if expanded_rollout_path else ""
                 )
                 db_title = good_title(title)
+                preview_title = good_title(preview)
+                first_message_title = good_title(first_user_message)
                 if is_auto_thread:
-                    clean_title = db_title or index_titles.get(session_id, "") or latest_title
+                    clean_title = choose_best_title(
+                        db_title,
+                        index_titles.get(session_id, ""),
+                        first_message_title,
+                        preview_title,
+                        latest_title,
+                    )
                 else:
-                    clean_title = latest_title or db_title or index_titles.get(session_id, "")
+                    clean_title = choose_best_title(
+                        db_title,
+                        index_titles.get(session_id, ""),
+                        first_message_title,
+                        preview_title,
+                        latest_title,
+                    )
                 if clean_title:
                     sqlite_titles[session_id] = clean_title
                 mtime = int(state_db.stat().st_mtime)
@@ -5097,11 +5310,11 @@ if base.exists():
                 stat = path.stat()
             except OSError:
                 continue
-            if now - stat.st_mtime > 7 * 86400:
+            if scan_age_seconds and now - stat.st_mtime > scan_age_seconds:
                 continue
             scan_paths.append((stat.st_mtime, path, stat))
         scan_paths.sort(key=lambda item: item[0], reverse=True)
-        scan_paths = scan_paths[:50]
+        scan_paths = scan_paths[:scan_limit]
     except Exception:
         scan_paths = []
 for _, path, stat in scan_paths:
@@ -5163,7 +5376,15 @@ for _, path, stat in scan_paths:
         continue
     indexed_title = index_titles.get(session_id) or index_titles.get(sqlite_session_id)
     latest_user_title = latest_user_title_from_path(path)
-    selected_title = latest_user_title or sqlite_title or indexed_title or first_user_title or title or "Codex session"
+    selected_title = choose_best_title(
+        sqlite_title,
+        indexed_title,
+        first_user_title,
+        latest_user_title,
+        title,
+    ) or "Codex session"
+    if "/status" in selected_title.lower() and len(selected_title) < 40:
+        selected_title = "Codex session"
     records.append({
         "id": session_id,
         "cwd": display_cwd,
@@ -5181,8 +5402,76 @@ for record in sqlite_records:
         records.append(record)
         seen_ids.add(record["id"])
 
+def title_quality(value):
+    clean = good_title(value)
+    if not clean:
+        return 0
+    lower = clean.lower()
+    score = 10
+    if (
+        lower.startswith("a0 ")
+        or lower.startswith("a0-")
+        or "central" in lower
+        or "coordinator" in lower
+        or "compact" in lower
+        or "factory" in lower
+        or "controller" in lower
+    ):
+        score += 5
+    if "aq" in lower or "html" in lower or "report" in lower:
+        score += 2
+    if "진행상황" in lower or "작업중" in lower or "보고" in lower:
+        score -= 3
+    if len(clean) < 8:
+        score -= 4
+    return score
+
+def better_record(first, second):
+    if int(second.get("mtime") or 0) > int(first.get("mtime") or 0):
+        merged = dict(second)
+        other = first
+    else:
+        merged = dict(first)
+        other = second
+    first_title = good_title(first.get("title") or "")
+    second_title = good_title(second.get("title") or "")
+    first_score = title_quality(first_title)
+    second_score = title_quality(second_title)
+    if first_score or second_score:
+        if second_score > first_score:
+            merged["title"] = second_title
+        elif first_score > second_score:
+            merged["title"] = first_title
+        else:
+            merged["title"] = second_title if int(second.get("mtime") or 0) >= int(first.get("mtime") or 0) else first_title
+    else:
+        merged["title"] = "Codex session"
+    if not str(merged.get("path") or "").strip():
+        merged["path"] = str(other.get("path") or "")
+    if not str(merged.get("cwd") or "").strip():
+        merged["cwd"] = str(other.get("cwd") or "")
+    merged["mtime"] = max(int(first.get("mtime") or 0), int(second.get("mtime") or 0))
+    return merged
+
+deduped = {}
+for record in records:
+    record_id = str(record.get("id") or "").strip()
+    if not record_id:
+        record_id = str(record.get("path") or "").strip()
+    if not record_id:
+        continue
+    record_host = str(record.get("host") or host).strip().lower() or host
+    key = f"{record_host}|{record_id}"
+    if key in deduped:
+        deduped[key] = better_record(deduped[key], record)
+    else:
+        next_record = dict(record)
+        next_record["title"] = good_title(next_record.get("title") or "") or "Codex session"
+        deduped[key] = next_record
+
+records = list(deduped.values())
 records.sort(key=lambda item: item["mtime"], reverse=True)
-print(json.dumps(records[:200], ensure_ascii=False))
+print(json.dumps(records[:output_limit], ensure_ascii=False))
 PY
   then
     cat "$tmp_file"

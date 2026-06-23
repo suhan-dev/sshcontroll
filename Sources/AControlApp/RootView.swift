@@ -7,8 +7,9 @@ struct RootView: View {
   @State private var renamingSession: SessionCard?
   @State private var renameText = ""
   @State private var expandedSidebarProjectIDs: Set<String> = []
+  @State private var sidebarSearchText = ""
 
-  private let collapsedProjectSessionLimit = 5
+  private let collapsedProjectSessionLimit = 10
 
   var body: some View {
     GeometryReader { proxy in
@@ -112,10 +113,31 @@ struct RootView: View {
       .padding(.horizontal, 10)
 
       VStack(alignment: .leading, spacing: 8) {
-        Text("Projects")
-          .font(.caption.weight(.bold))
-          .foregroundStyle(.secondary)
-          .padding(.horizontal, 14)
+        HStack(spacing: 8) {
+          Text("Projects")
+            .font(.caption.weight(.bold))
+            .foregroundStyle(.secondary)
+          Spacer(minLength: 0)
+          if !sidebarSearchText.trimmed.isEmpty {
+            Text("\(filteredSidebarSessionCount)")
+              .font(.caption2.weight(.bold))
+              .foregroundStyle(.secondary)
+          }
+        }
+        .padding(.horizontal, 14)
+
+        HStack(spacing: 7) {
+          Image(systemName: "magnifyingglass")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(.secondary)
+          TextField("Search sessions", text: $sidebarSearchText)
+            .textFieldStyle(.plain)
+            .font(.system(size: 13, weight: .medium))
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 32)
+        .background(Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.045), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .padding(.horizontal, 10)
 
         ScrollView {
           LazyVStack(alignment: .leading, spacing: 12) {
@@ -138,10 +160,15 @@ struct RootView: View {
   }
 
   private var sidebarProjectGroups: [SidebarProjectGroup] {
+    let search = sidebarSearchText.trimmed.lowercased()
+    let searchableSessions =
+      search.isEmpty
+      ? model.sessions
+      : model.sessions.filter { sidebarSession($0, matches: search) }
     let selectedGroupID = model.sessions
       .first(where: { $0.id == model.activeSessionID })
       .map { sidebarProjectID(for: $0.remoteDir) }
-    let grouped = Dictionary(grouping: model.sessions) { session in
+    let grouped = Dictionary(grouping: searchableSessions) { session in
       sidebarProjectID(for: session.remoteDir)
     }
     let groups = grouped.map { id, sessions in
@@ -179,8 +206,29 @@ struct RootView: View {
     }
   }
 
+  private var filteredSidebarSessionCount: Int {
+    let search = sidebarSearchText.trimmed.lowercased()
+    guard !search.isEmpty else { return model.sessions.count }
+    return model.sessions.filter { sidebarSession($0, matches: search) }.count
+  }
+
+  private func sidebarSession(_ session: SessionCard, matches search: String) -> Bool {
+    [
+      session.displayTitle,
+      session.name,
+      session.codexHistoryTitle,
+      session.codexHistoryID,
+      session.remoteDir,
+      session.agentSummary,
+    ]
+    .joined(separator: " ")
+    .lowercased()
+    .contains(search)
+  }
+
   private func sidebarProjectSection(_ group: SidebarProjectGroup) -> some View {
-    let isExpanded = expandedSidebarProjectIDs.contains(group.id)
+    let isSearching = !sidebarSearchText.trimmed.isEmpty
+    let isExpanded = isSearching || expandedSidebarProjectIDs.contains(group.id)
     let visibleSessions =
       isExpanded
       ? group.sessions
@@ -190,10 +238,11 @@ struct RootView: View {
         title: group.title,
         detail: group.detail,
         isWorking: group.hasWorking,
-        isSelected: group.sessions.contains { $0.id == model.activeSessionID }
+        isSelected: group.sessions.contains { $0.id == model.activeSessionID },
+        isExpanded: isExpanded,
+        sessionCount: group.sessions.count
       ) {
-        guard let first = group.sessions.first else { return }
-        Task { await model.openSession(first) }
+        toggleSidebarProjectExpansion(group.id)
       }
 
       ForEach(visibleSessions) { session in
@@ -223,11 +272,11 @@ struct RootView: View {
         }
       }
 
-      if group.sessions.count > collapsedProjectSessionLimit {
+      if group.sessions.count > collapsedProjectSessionLimit && !isSearching {
         Button {
           toggleSidebarProjectExpansion(group.id)
         } label: {
-          Text(isExpanded ? "Show less" : "Show more")
+          Text(isExpanded ? "Show less" : "Show \(group.sessions.count - collapsedProjectSessionLimit) more")
             .font(.system(size: 12.5, weight: .medium))
             .foregroundStyle(.secondary)
             .padding(.leading, 30)
@@ -300,7 +349,7 @@ struct RootView: View {
   }
 
   private var stableSidebarWidth: CGFloat {
-    236
+    320
   }
 
   @ViewBuilder
@@ -364,6 +413,8 @@ private struct SidebarProjectHeaderRow: View {
   var detail: String
   var isWorking: Bool
   var isSelected: Bool
+  var isExpanded: Bool
+  var sessionCount: Int
   var action: () -> Void
 
   var body: some View {
@@ -395,6 +446,18 @@ private struct SidebarProjectHeaderRow: View {
           }
         }
         Spacer(minLength: 0)
+        if sessionCount > 0 {
+          Text("\(sessionCount)")
+            .font(.system(size: 10.5, weight: .bold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 6)
+            .frame(height: 18)
+            .background(Color.primary.opacity(colorScheme == .dark ? 0.10 : 0.055), in: Capsule())
+        }
+        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+          .font(.system(size: 10, weight: .bold))
+          .foregroundStyle(.secondary.opacity(0.76))
+          .frame(width: 12)
       }
       .padding(.horizontal, 8)
       .padding(.vertical, 6)
@@ -635,7 +698,7 @@ private struct SidebarSessionRow: View {
     Button(action: action) {
       VStack(alignment: .leading, spacing: 3) {
         HStack(spacing: 6) {
-          Text(compact(session.displayTitle, limit: showsPath ? 44 : 38))
+          Text(compact(session.displayTitle, limit: showsPath ? 56 : 58))
             .font(.callout.weight(isSelected ? .semibold : .medium))
             .lineLimit(1)
           Spacer(minLength: 0)

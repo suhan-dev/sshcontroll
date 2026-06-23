@@ -2754,11 +2754,22 @@ struct CodexTranscriptCard: View {
         }
       }
       .onChange(of: text) { _, _ in
-        guard transcriptAtBottom && !userHasScrolledAway else { return }
+        guard !isLoadingMoreTranscript else { return }
+        guard !userHasScrolledAway else { return }
+        suppressAwayReportsUntil = Date().addingTimeInterval(0.65)
         userHasScrolledAway = false
         wheelScrollButtonFallback = false
+        transcriptAtBottom = true
+        transcriptDistanceToBottom = 0
         DispatchQueue.main.async {
           followTailSignal += 1
+          scrollSignal += 1
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            scrollSignal += 1
+          }
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.34) {
+            scrollSignal += 1
+          }
         }
       }
       .onChange(of: scrollRequest) { _, _ in
@@ -3170,7 +3181,7 @@ struct CodexActivityTranscriptView: View {
         resetForSessionChange(newValue, proxy: proxy)
       }
       .onChange(of: followTailSignal) { _, _ in
-        scheduleScrollToBottom(proxy, force: false, delay: 70_000_000)
+        scheduleScrollToBottom(proxy, force: !userIsReadingHistory, delay: 70_000_000)
       }
       .onAppear {
         scheduleScrollToBottom(proxy, force: true, delay: 90_000_000)
@@ -3187,7 +3198,7 @@ struct CodexActivityTranscriptView: View {
         let nextItems = parsed.enumerated().map { index, item in
           item.withStableID(index: index)
         }
-        let shouldKeepPinned = canFollowTail
+        let shouldKeepPinned = !userIsReadingHistory
         let shouldForceForSession = pendingSessionResetScrollSignal == sessionResetSignal
         parsedItems = nextItems
         if shouldForceForSession {
@@ -3281,7 +3292,7 @@ private struct CodexScrollPositionObserver: NSViewRepresentable {
       view.attachIfNeeded()
       if view.lastScrollSignal != scrollSignal {
         view.lastScrollSignal = scrollSignal
-        view.scrollToBottom()
+        view.scrollToBottom(repeating: true)
       }
       view.report()
     }
@@ -3385,7 +3396,18 @@ private struct CodexScrollPositionObserver: NSViewRepresentable {
       onBottomStateChange?(visible, distance)
     }
 
-    func scrollToBottom() {
+    func scrollToBottom(repeating: Bool = false) {
+      performScrollToBottom()
+      guard repeating else { return }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+        self?.performScrollToBottom()
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) { [weak self] in
+        self?.performScrollToBottom()
+      }
+    }
+
+    private func performScrollToBottom() {
       guard let scrollView, let documentView = scrollView.documentView else { return }
       documentView.layoutSubtreeIfNeeded()
       scrollView.contentView.layoutSubtreeIfNeeded()

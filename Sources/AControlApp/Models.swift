@@ -997,15 +997,25 @@ struct SessionCard: Identifiable, Codable, Hashable {
 
   var displayTitle: String {
     let codexTitle = codexHistoryTitle.trimmed
-    if !codexTitle.isEmpty {
+    if !codexTitle.isEmpty, !Self.isSyntheticCodexFallbackTitle(codexTitle) {
       return codexTitle
     }
     let sessionName = name.trimmed
-    if !sessionName.isEmpty {
+    if !sessionName.isEmpty, !Self.isSyntheticCodexFallbackTitle(sessionName) {
       return sessionName
     }
     let dirName = remoteDir.trimmed.split(separator: "/").last.map(String.init) ?? ""
+    if !codexHistoryID.trimmed.isEmpty {
+      return dirName.isEmpty ? "Codex History" : "\(dirName) Codex History"
+    }
     return dirName.isEmpty ? "Untitled" : dirName
+  }
+
+  private static func isSyntheticCodexFallbackTitle(_ value: String) -> Bool {
+    value.range(
+      of: #"^[A-Za-z0-9가-힣_ .-]{1,56}\s+[0-9a-f]{8}$"#,
+      options: [.regularExpression, .caseInsensitive]
+    ) != nil
   }
 
   var agentSummary: String {

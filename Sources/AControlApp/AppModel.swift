@@ -1893,7 +1893,7 @@ final class AppModel: ObservableObject {
     if !path.trimmed.isEmpty {
       sessions[index].codexHistoryPath = path.trimmed
     }
-    if !displayTitle.isEmpty {
+    if sessions[index].codexHistoryTitle != displayTitle {
       sessions[index].codexHistoryTitle = displayTitle
       if sessions[index].nameSource == .codexApp {
         sessions[index].name = stableCodexSessionName(id: trimmedID, cwd: sessions[index].remoteDir)
@@ -1932,7 +1932,7 @@ final class AppModel: ObservableObject {
     if !path.trimmed.isEmpty {
       sessions[index].codexHistoryPath = path.trimmed
     }
-    if !displayTitle.isEmpty {
+    if sessions[index].codexHistoryTitle != displayTitle {
       sessions[index].codexHistoryTitle = displayTitle
       if sessions[index].nameSource == .codexApp {
         sessions[index].name = stableCodexSessionName(id: trimmedID, cwd: sessions[index].remoteDir)
@@ -1962,12 +1962,7 @@ final class AppModel: ObservableObject {
     for index in sessions.indices {
       let currentTitle = sessions[index].codexHistoryTitle.trimmed
       let cleanTitle = cleanCodexHistoryTitle(currentTitle)
-      let fallback = titleForCodexHistory(
-        id: sessions[index].codexHistoryID,
-        cwd: sessions[index].remoteDir,
-        rawTitle: currentTitle
-      )
-      let nextTitle = cleanTitle ?? fallback
+      let nextTitle = cleanTitle ?? ""
       if sessions[index].codexHistoryTitle != nextTitle {
         sessions[index].codexHistoryTitle = nextTitle
         changed = true
@@ -2012,7 +2007,7 @@ final class AppModel: ObservableObject {
     if let title = cleanCodexHistoryTitle(rawTitle) {
       return title
     }
-    return stableCodexSessionName(id: id, cwd: cwd)
+    return ""
   }
 
   private func stableCodexSessionName(id: String, cwd: String) -> String {
@@ -2033,6 +2028,15 @@ final class AppModel: ObservableObject {
       .trimmed
     guard !title.isEmpty else { return nil }
     let lower = title.lowercased()
+    if lower == "codex session" || (lower.contains("/status") && title.count < 40) {
+      return nil
+    }
+    if title.range(
+      of: #"^[A-Za-z0-9가-힣_ .-]{1,56}\s+[0-9a-f]{8}$"#,
+      options: [.regularExpression, .caseInsensitive]
+    ) != nil {
+      return nil
+    }
     let blockedFragments = [
       "<environment_context",
       "</environment_context",
@@ -2072,6 +2076,12 @@ final class AppModel: ObservableObject {
     }
     let firstLine = title.components(separatedBy: .newlines).first?.trimmed ?? title
     guard !firstLine.isEmpty else { return nil }
+    if firstLine.range(
+      of: #"^[A-Za-z0-9가-힣_ .-]{1,56}\s+[0-9a-f]{8}$"#,
+      options: [.regularExpression, .caseInsensitive]
+    ) != nil {
+      return nil
+    }
     if firstLine.range(
       of: #"^(?:cd(?:\s|$)|pwd(?:\s|$)|ls(?:\s|$)|clear$|/(?:status|model|permissions)\b)"#,
       options: [.regularExpression, .caseInsensitive]
@@ -2502,14 +2512,76 @@ final class AppModel: ObservableObject {
     _ first: CodexHistoryRecord,
     _ second: CodexHistoryRecord
   ) -> CodexHistoryRecord {
+    var merged: CodexHistoryRecord
     if first.mtime != second.mtime {
-      return first.mtime > second.mtime ? first : second
+      merged = first.mtime > second.mtime ? first : second
+    } else if !first.path.trimmed.isEmpty, second.path.trimmed.isEmpty {
+      merged = first
+    } else if first.path.trimmed.isEmpty, !second.path.trimmed.isEmpty {
+      merged = second
+    } else if first.normalizedHost == "remote", second.normalizedHost != "remote" {
+      merged = first
+    } else if second.normalizedHost == "remote", first.normalizedHost != "remote" {
+      merged = second
+    } else {
+      merged = second
     }
-    if !first.path.trimmed.isEmpty, second.path.trimmed.isEmpty { return first }
-    if first.path.trimmed.isEmpty, !second.path.trimmed.isEmpty { return second }
-    if first.normalizedHost == "remote", second.normalizedHost != "remote" { return first }
-    if second.normalizedHost == "remote", first.normalizedHost != "remote" { return second }
-    return second
+
+    let title = betterCodexHistoryTitle(first.title, second.title)
+    merged.title = title
+    if merged.path.trimmed.isEmpty {
+      merged.path = first.path.trimmed.isEmpty ? second.path : first.path
+    }
+    if merged.cwd.trimmed.isEmpty {
+      merged.cwd = first.cwd.trimmed.isEmpty ? second.cwd : first.cwd
+    }
+    merged.mtime = max(first.mtime, second.mtime)
+    merged.host = merged.normalizedHost
+    return merged
+  }
+
+  private func betterCodexHistoryTitle(_ first: String, _ second: String) -> String {
+    let firstClean = cleanCodexHistoryTitle(first)
+    let secondClean = cleanCodexHistoryTitle(second)
+    switch (firstClean, secondClean) {
+    case let (first?, second?):
+      let firstScore = codexHistoryTitleScore(first)
+      let secondScore = codexHistoryTitleScore(second)
+      if firstScore != secondScore {
+        return firstScore > secondScore ? first : second
+      }
+      return first.count >= second.count ? first : second
+    case let (first?, nil):
+      return first
+    case let (nil, second?):
+      return second
+    case (nil, nil):
+      return ""
+    }
+  }
+
+  private func codexHistoryTitleScore(_ title: String) -> Int {
+    let lower = title.lowercased()
+    var score = 10
+    if lower.hasPrefix("a0 ") || lower.hasPrefix("a0-")
+      || lower.contains("central")
+      || lower.contains("coordinator")
+      || lower.contains("compact")
+      || lower.contains("factory")
+      || lower.contains("controller")
+    {
+      score += 5
+    }
+    if lower.contains("aq") || lower.contains("html") || lower.contains("report") {
+      score += 2
+    }
+    if lower.contains("진행상황") || lower.contains("작업중") || lower.contains("보고") {
+      score -= 3
+    }
+    if title.count < 8 {
+      score -= 4
+    }
+    return score
   }
 
   func prepareNetworkOnLaunch() async {
@@ -2607,7 +2679,9 @@ final class AppModel: ObservableObject {
           async let sessions: Void = self.syncCodexAppSessions(
             showsActivity: false,
             force: false,
-            refreshWorkingAfter: false
+            refreshWorkingAfter: false,
+            allowNewImports: true,
+            onlyCurrentDirectory: true
           )
           _ = await (working, sessions)
         }
@@ -2640,7 +2714,9 @@ final class AppModel: ObservableObject {
       await self?.syncCodexAppSessions(
         showsActivity: false,
         force: true,
-        refreshWorkingAfter: false
+        refreshWorkingAfter: false,
+        allowNewImports: true,
+        includeAllDirectories: true
       )
       try? await Task.sleep(nanoseconds: 2_000_000_000)
       await self?.refreshCodexTokenStatus(showStatus: false, force: true)
@@ -2692,7 +2768,9 @@ final class AppModel: ObservableObject {
         await self?.syncCodexAppSessions(
           showsActivity: false,
           force: false,
-          refreshWorkingAfter: false
+          refreshWorkingAfter: false,
+          allowNewImports: true,
+          onlyCurrentDirectory: true
         )
       }
     }
@@ -3272,6 +3350,11 @@ final class AppModel: ObservableObject {
     var remoteEnvironment = [
       "A_COCKPIT_CODEX_HISTORY_HOST": "remote"
     ]
+    remoteEnvironment["A_COCKPIT_CODEX_HISTORY_LIMIT"] =
+      includeAllDirectories ? "1200" : "700"
+    remoteEnvironment["A_COCKPIT_CODEX_HISTORY_SCAN_LIMIT"] =
+      includeAllDirectories ? "1800" : "1200"
+    remoteEnvironment["A_COCKPIT_CODEX_HISTORY_MAX_AGE_DAYS"] = "0"
     if force {
       remoteEnvironment["A_COCKPIT_CODEX_HISTORY_FORCE"] = "1"
     }
@@ -3505,20 +3588,11 @@ final class AppModel: ObservableObject {
 
   @discardableResult
   private func pruneNoisyImportedCodexSessions(save shouldSave: Bool) -> Bool {
-    let userDirectories = Set(
-      sessions
-        .filter { $0.nameSource == .user }
-        .map { normalizedRemotePath($0.remoteDir) }
-    )
-    guard !userDirectories.isEmpty else { return false }
     var removeIDs = Set<UUID>()
     var removedHistoryIDs = Set<String>()
     for session in sessions {
       guard session.nameSource == .codexApp else { continue }
-      let sameUserDirectory = userDirectories.contains(normalizedRemotePath(session.remoteDir))
-      guard (sameUserDirectory && isGenericImportedCodexSession(session))
-        || isSubagentLikeImportedCodexSession(session)
-      else { continue }
+      guard isSubagentLikeImportedCodexSession(session) else { continue }
       removeIDs.insert(session.id)
       let historyID = session.codexHistoryID.trimmed
       if !historyID.isEmpty {
