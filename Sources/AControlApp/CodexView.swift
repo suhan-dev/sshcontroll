@@ -2490,6 +2490,7 @@ struct CodexTranscriptCard: View {
   @EnvironmentObject private var model: AppModel
   @Environment(\.colorScheme) private var colorScheme
   @State private var scrollSignal = 0
+  @State private var sessionScrollSignal = 0
   @State private var followTailSignal = 0
   @State private var transcriptAtBottom = true
   @State private var userHasScrolledAway = false
@@ -2730,6 +2731,7 @@ struct CodexTranscriptCard: View {
         userHasScrolledAway = false
         wheelScrollButtonFallback = false
         DispatchQueue.main.async {
+          sessionScrollSignal += 1
           scrollSignal += 1
           userHasScrolledAway = false
           wheelScrollButtonFallback = false
@@ -2768,6 +2770,7 @@ struct CodexTranscriptCard: View {
         text: text,
         placeholder: placeholder,
         scrollSignal: scrollSignal,
+        sessionResetSignal: sessionScrollSignal,
         followTailSignal: followTailSignal,
         userIsReadingHistory: userHasScrolledAway,
         canLoadMore: canLoadMoreTranscript,
@@ -2965,6 +2968,7 @@ struct CodexActivityTranscriptView: View {
   var text: String
   var placeholder: String
   var scrollSignal: Int
+  var sessionResetSignal: Int = 0
   var followTailSignal: Int
   var userIsReadingHistory = false
   var canLoadMore = false
@@ -2975,13 +2979,14 @@ struct CodexActivityTranscriptView: View {
   @State private var isAtBottom = true
   @State private var pendingAutoScrollTask: Task<Void, Never>?
   @State private var lastAutoScrollAt = Date.distantPast
+  @State private var pendingSessionResetScrollSignal: Int?
   @State private var parsedItems: [CodexActivityItem] = []
   @State private var expandedTextIDs: Set<String> = []
 
   private var parseKey: String {
     let source = hasTranscriptText ? text : placeholder
     return
-      "\(hasTranscriptText ? "transcript" : "placeholder"):\(source.count):\(source.prefix(160)):\(source.suffix(512))"
+      "\(sessionResetSignal):\(hasTranscriptText ? "transcript" : "placeholder"):\(source.count):\(source.prefix(160)):\(source.suffix(512))"
   }
 
   private var hasTranscriptText: Bool {
@@ -3102,6 +3107,9 @@ struct CodexActivityTranscriptView: View {
       .onChange(of: scrollSignal) { _, _ in
         scheduleScrollToBottom(proxy, force: true, notify: true, delay: 15_000_000)
       }
+      .onChange(of: sessionResetSignal) { _, newValue in
+        resetForSessionChange(newValue, proxy: proxy)
+      }
       .onChange(of: followTailSignal) { _, _ in
         scheduleScrollToBottom(proxy, force: false, delay: 70_000_000)
       }
@@ -3121,8 +3129,15 @@ struct CodexActivityTranscriptView: View {
           item.withStableID(index: index)
         }
         let shouldKeepPinned = canFollowTail
+        let shouldForceForSession = pendingSessionResetScrollSignal == sessionResetSignal
         parsedItems = nextItems
-        if shouldKeepPinned {
+        if shouldForceForSession {
+          isAtBottom = true
+          scheduleScrollToBottom(proxy, force: true, notify: true, delay: 30_000_000)
+          if hasTranscriptText {
+            pendingSessionResetScrollSignal = nil
+          }
+        } else if shouldKeepPinned {
           scheduleScrollToBottom(proxy, force: false, delay: 50_000_000)
         }
       }
@@ -3147,6 +3162,14 @@ struct CodexActivityTranscriptView: View {
       guard !Task.isCancelled else { return }
       scrollToBottom(proxy, force: force, notify: notify)
     }
+  }
+
+  private func resetForSessionChange(_ signal: Int, proxy: ScrollViewProxy) {
+    pendingSessionResetScrollSignal = signal
+    expandedTextIDs.removeAll()
+    isAtBottom = true
+    lastAutoScrollAt = .distantPast
+    scheduleScrollToBottom(proxy, force: true, notify: true, delay: 10_000_000)
   }
 
   private func scrollToBottom(
