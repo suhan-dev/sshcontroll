@@ -995,6 +995,19 @@ struct SessionCard: Identifiable, Codable, Hashable {
     self.updatedAt = Date()
   }
 
+  var displayTitle: String {
+    let codexTitle = codexHistoryTitle.trimmed
+    if !codexTitle.isEmpty {
+      return codexTitle
+    }
+    let sessionName = name.trimmed
+    if !sessionName.isEmpty {
+      return sessionName
+    }
+    let dirName = remoteDir.trimmed.split(separator: "/").last.map(String.init) ?? ""
+    return dirName.isEmpty ? "Untitled" : dirName
+  }
+
   var agentSummary: String {
     normalizedEnabledTools
       .map { agentSummary(for: $0) }

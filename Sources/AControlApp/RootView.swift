@@ -6,6 +6,9 @@ struct RootView: View {
   @Environment(\.colorScheme) private var colorScheme
   @State private var renamingSession: SessionCard?
   @State private var renameText = ""
+  @State private var expandedSidebarProjectIDs: Set<String> = []
+
+  private let collapsedProjectSessionLimit = 5
 
   var body: some View {
     GeometryReader { proxy in
@@ -109,36 +112,15 @@ struct RootView: View {
       .padding(.horizontal, 10)
 
       VStack(alignment: .leading, spacing: 8) {
-        Text("Sessions")
+        Text("Projects")
           .font(.caption.weight(.bold))
           .foregroundStyle(.secondary)
           .padding(.horizontal, 14)
 
         ScrollView {
-          LazyVStack(spacing: 6) {
-            ForEach(model.sessions) { session in
-              SidebarSessionRow(
-                session: session,
-                isSelected: model.activeSessionID == session.id,
-                isCodexWorking: model.codexWorkingSessionIDs.contains(session.id),
-                isClaudeWorking: model.claudeWorkingSessionIDs.contains(session.id),
-                remoteHome: model.settings.remoteHome
-              ) {
-                Task { await model.openSession(session) }
-              }
-              .contextMenu {
-                Button("Rename") {
-                  renameText = session.name
-                  renamingSession = session
-                }
-                Button("Open Chat Folder") {
-                  model.openSessionFolder(session)
-                }
-                Divider()
-                Button("Delete Session", role: .destructive) {
-                  Task { await model.deleteSession(session) }
-                }
-              }
+          LazyVStack(alignment: .leading, spacing: 12) {
+            ForEach(sidebarProjectGroups) { group in
+              sidebarProjectSection(group)
             }
           }
           .padding(.horizontal, 10)
@@ -153,6 +135,168 @@ struct RootView: View {
         .fill(sidebarBackground)
         .ignoresSafeArea()
     }
+  }
+
+  private var sidebarProjectGroups: [SidebarProjectGroup] {
+    let selectedGroupID = model.sessions
+      .first(where: { $0.id == model.activeSessionID })
+      .map { sidebarProjectID(for: $0.remoteDir) }
+    let grouped = Dictionary(grouping: model.sessions) { session in
+      sidebarProjectID(for: session.remoteDir)
+    }
+    let groups = grouped.map { id, sessions in
+      let sortedSessions = sessions.sorted { first, second in
+        if first.id == model.activeSessionID { return true }
+        if second.id == model.activeSessionID { return false }
+        let firstWorking =
+          model.codexWorkingSessionIDs.contains(first.id)
+          || model.claudeWorkingSessionIDs.contains(first.id)
+        let secondWorking =
+          model.codexWorkingSessionIDs.contains(second.id)
+          || model.claudeWorkingSessionIDs.contains(second.id)
+        if firstWorking != secondWorking { return firstWorking }
+        return first.updatedAt > second.updatedAt
+      }
+      let rawPath = sessions.first?.remoteDir.trimmed ?? ""
+      let hasWorking = sessions.contains {
+        model.codexWorkingSessionIDs.contains($0.id)
+          || model.claudeWorkingSessionIDs.contains($0.id)
+      }
+      return SidebarProjectGroup(
+        id: id,
+        title: sidebarProjectTitle(for: rawPath),
+        detail: sidebarProjectDetail(for: rawPath),
+        sessions: sortedSessions,
+        hasWorking: hasWorking,
+        updatedAt: sortedSessions.map(\.updatedAt).max() ?? .distantPast
+      )
+    }
+    return groups.sorted { first, second in
+      if first.id == selectedGroupID { return true }
+      if second.id == selectedGroupID { return false }
+      if first.hasWorking != second.hasWorking { return first.hasWorking }
+      return first.updatedAt > second.updatedAt
+    }
+  }
+
+  private func sidebarProjectSection(_ group: SidebarProjectGroup) -> some View {
+    let isExpanded = expandedSidebarProjectIDs.contains(group.id)
+    let visibleSessions =
+      isExpanded
+      ? group.sessions
+      : Array(group.sessions.prefix(collapsedProjectSessionLimit))
+    return VStack(alignment: .leading, spacing: 4) {
+      SidebarProjectHeaderRow(
+        title: group.title,
+        detail: group.detail,
+        isWorking: group.hasWorking,
+        isSelected: group.sessions.contains { $0.id == model.activeSessionID }
+      ) {
+        guard let first = group.sessions.first else { return }
+        Task { await model.openSession(first) }
+      }
+
+      ForEach(visibleSessions) { session in
+        SidebarSessionRow(
+          session: session,
+          isSelected: model.activeSessionID == session.id,
+          isCodexWorking: model.codexWorkingSessionIDs.contains(session.id),
+          isClaudeWorking: model.claudeWorkingSessionIDs.contains(session.id),
+          remoteHome: model.settings.remoteHome,
+          showsPath: false,
+          indentation: 28
+        ) {
+          Task { await model.openSession(session) }
+        }
+        .contextMenu {
+          Button("Rename") {
+            renameText = session.displayTitle
+            renamingSession = session
+          }
+          Button("Open Chat Folder") {
+            model.openSessionFolder(session)
+          }
+          Divider()
+          Button("Delete Session", role: .destructive) {
+            Task { await model.deleteSession(session) }
+          }
+        }
+      }
+
+      if group.sessions.count > collapsedProjectSessionLimit {
+        Button {
+          toggleSidebarProjectExpansion(group.id)
+        } label: {
+          Text(isExpanded ? "Show less" : "Show more")
+            .font(.system(size: 12.5, weight: .medium))
+            .foregroundStyle(.secondary)
+            .padding(.leading, 30)
+            .frame(height: 28)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(ImmediateFeedbackButtonStyle())
+      }
+    }
+  }
+
+  private func toggleSidebarProjectExpansion(_ id: String) {
+    if expandedSidebarProjectIDs.contains(id) {
+      expandedSidebarProjectIDs.remove(id)
+    } else {
+      expandedSidebarProjectIDs.insert(id)
+    }
+  }
+
+  private func sidebarProjectID(for rawPath: String) -> String {
+    let normalized = normalizedSidebarProjectPath(rawPath)
+    return normalized.isEmpty ? "__sshcontroll_no_folder__" : normalized
+  }
+
+  private func normalizedSidebarProjectPath(_ rawPath: String) -> String {
+    var value = rawPath.trimmed
+    guard !value.isEmpty else { return "" }
+    while value.count > 1, value.hasSuffix("/") {
+      value.removeLast()
+    }
+    if value == "." || value == "~" || value == model.settings.remoteHome.trimmed {
+      return value
+    }
+    return value
+  }
+
+  private func sidebarProjectTitle(for rawPath: String) -> String {
+    let path = normalizedSidebarProjectPath(rawPath)
+    guard !path.isEmpty else { return "No Folder" }
+    if path == "~" || path == model.settings.remoteHome.trimmed {
+      return "Home"
+    }
+    return path.split(separator: "/").last.map(String.init) ?? path
+  }
+
+  private func sidebarProjectDetail(for rawPath: String) -> String {
+    let host =
+      model.settings.hostAlias.trimmed.isEmpty
+      ? model.settings.remoteLabel.trimmed
+      : model.settings.hostAlias.trimmed
+    let shortPath = shortSidebarPath(rawPath)
+    if shortPath.isEmpty {
+      return host.isEmpty ? "No working folder" : host
+    }
+    if host.isEmpty { return shortPath }
+    return "\(host) · \(shortPath)"
+  }
+
+  private func shortSidebarPath(_ rawPath: String) -> String {
+    let path = normalizedSidebarProjectPath(rawPath)
+    guard !path.isEmpty else { return "" }
+    let remoteHome = model.settings.remoteHome.trimmed
+    guard !remoteHome.isEmpty else { return path }
+    if path == remoteHome { return "~" }
+    if path.hasPrefix(remoteHome + "/") {
+      return "~/" + String(path.dropFirst(remoteHome.count + 1))
+    }
+    return path
   }
 
   private var stableSidebarWidth: CGFloat {
@@ -202,6 +346,66 @@ struct RootView: View {
       return AnyShapeStyle(Color(red: 0.118, green: 0.127, blue: 0.144))
     }
     return AnyShapeStyle(Color(red: 0.965, green: 0.982, blue: 0.992))
+  }
+}
+
+private struct SidebarProjectGroup: Identifiable {
+  var id: String
+  var title: String
+  var detail: String
+  var sessions: [SessionCard]
+  var hasWorking: Bool
+  var updatedAt: Date
+}
+
+private struct SidebarProjectHeaderRow: View {
+  @Environment(\.colorScheme) private var colorScheme
+  var title: String
+  var detail: String
+  var isWorking: Bool
+  var isSelected: Bool
+  var action: () -> Void
+
+  var body: some View {
+    Button(action: action) {
+      HStack(spacing: 9) {
+        Image(systemName: "folder")
+          .font(.system(size: 15, weight: .semibold))
+          .frame(width: 20)
+          .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 1) {
+          HStack(spacing: 7) {
+            Text(title)
+              .font(.system(size: 14.5, weight: .semibold))
+              .foregroundStyle(.primary.opacity(0.90))
+              .lineLimit(1)
+            if isWorking {
+              Circle()
+                .fill(Color.green)
+                .frame(width: 7, height: 7)
+                .shadow(color: Color.green.opacity(0.40), radius: 4)
+            }
+          }
+          if !detail.trimmed.isEmpty {
+            Text(detail)
+              .font(.system(size: 10.5, weight: .medium))
+              .foregroundStyle(.secondary)
+              .lineLimit(1)
+              .truncationMode(.middle)
+          }
+        }
+        Spacer(minLength: 0)
+      }
+      .padding(.horizontal, 8)
+      .padding(.vertical, 6)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(ImmediateFeedbackButtonStyle())
+    .background(
+      isSelected ? Color.primary.opacity(colorScheme == .dark ? 0.070 : 0.038) : Color.clear,
+      in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+    )
   }
 }
 
@@ -399,6 +603,8 @@ private struct SidebarSessionRow: View {
   var isCodexWorking: Bool
   var isClaudeWorking: Bool
   var remoteHome: String
+  var showsPath = true
+  var indentation: CGFloat = 0
   var action: () -> Void
 
   private var isWorking: Bool {
@@ -429,10 +635,16 @@ private struct SidebarSessionRow: View {
     Button(action: action) {
       VStack(alignment: .leading, spacing: 3) {
         HStack(spacing: 6) {
-          Text(compact(session.name, limit: 44))
+          Text(compact(session.displayTitle, limit: showsPath ? 44 : 38))
             .font(.callout.weight(isSelected ? .semibold : .medium))
             .lineLimit(1)
           Spacer(minLength: 0)
+          if !showsPath, !isWorking {
+            Text(relativeAge)
+              .font(.system(size: 11, weight: .semibold))
+              .foregroundStyle(.secondary)
+              .lineLimit(1)
+          }
           if isWorking {
             sessionActivityDot
             Text(workLabel)
@@ -446,11 +658,13 @@ private struct SidebarSessionRow: View {
               )
           }
         }
-        Text(shortPath(session.remoteDir))
-          .font(.caption2)
-          .foregroundStyle(.secondary)
-          .lineLimit(1)
-        if !sessionStatusSummary.isEmpty {
+        if showsPath {
+          Text(shortPath(session.remoteDir))
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+        }
+        if showsPath, !sessionStatusSummary.isEmpty {
           Text(sessionStatusSummary)
             .font(.caption2)
             .foregroundStyle(Color.secondary.opacity(0.82))
@@ -458,14 +672,18 @@ private struct SidebarSessionRow: View {
         }
       }
       .frame(maxWidth: .infinity, alignment: .leading)
-      .padding(.horizontal, 12)
-      .padding(.vertical, 9)
+      .padding(.leading, 12 + indentation)
+      .padding(.trailing, 10)
+      .padding(.vertical, showsPath ? 9 : 7)
       .contentShape(Rectangle())
     }
     .buttonStyle(ImmediateFeedbackButtonStyle())
-    .background(sessionFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    .background(
+      sessionFill,
+      in: RoundedRectangle(cornerRadius: showsPath ? 12 : 9, style: .continuous)
+    )
     .overlay {
-      RoundedRectangle(cornerRadius: 12, style: .continuous)
+      RoundedRectangle(cornerRadius: showsPath ? 12 : 9, style: .continuous)
         .strokeBorder(sessionStroke, lineWidth: isWorking ? 1.4 : 0.8)
     }
     .accessibilityLabel(accessibilitySummary)
@@ -503,9 +721,18 @@ private struct SidebarSessionRow: View {
     path.replacingOccurrences(of: remoteHome, with: "~")
   }
 
+  private var relativeAge: String {
+    let seconds = max(0, Date().timeIntervalSince(session.updatedAt))
+    if seconds < 60 { return "now" }
+    if seconds < 60 * 60 { return "\(Int(seconds / 60))m" }
+    if seconds < 24 * 60 * 60 { return "\(Int(seconds / 3_600))h" }
+    if seconds < 7 * 24 * 60 * 60 { return "\(Int(seconds / 86_400))d" }
+    return "\(Int(seconds / 604_800))w"
+  }
+
   private var accessibilitySummary: String {
     [
-      compact(session.name, limit: 60),
+      compact(session.displayTitle, limit: 60),
       shortPath(session.remoteDir),
       compact(session.agentSummary, limit: 120),
       isWorking ? workLabel : "",

@@ -250,7 +250,7 @@ struct CodeWorkspaceView: View {
       }
 
       if let activeSession = model.activeSession {
-        Text(activeSession.name)
+        Text(activeSession.displayTitle)
           .font(.caption.weight(.semibold))
           .foregroundStyle(palette.secondaryText.opacity(0.85))
           .lineLimit(1)

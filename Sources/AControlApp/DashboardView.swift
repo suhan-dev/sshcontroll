@@ -96,7 +96,7 @@ struct DashboardView: View {
     )
     .frame(maxWidth: .infinity)
     MetricCard(
-      title: "Session", value: model.activeSession?.name ?? "Default",
+      title: "Session", value: model.activeSession?.displayTitle ?? "Default",
       subtitle: model.activeSession?.dashboardAgentSummary ?? "Codex ready", symbol: "rectangle.stack",
       tint: .purple, valueSize: 20, valueLineLimit: 1, minHeight: 104, padding: 14
     )

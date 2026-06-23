@@ -27,7 +27,13 @@ final class AppModel: ObservableObject {
   private static let deliveredCodexQueueRetentionSeconds: TimeInterval = 6 * 60 * 60
   private static let deliveredResearchQueueRetentionSeconds: TimeInterval = 72 * 60 * 60
   private static let defaultCodexTranscriptTailBytes = 4 * 1024 * 1024
+  private static let backgroundCodexTranscriptTailBytes = 1 * 1024 * 1024
+  private static let codexTranscriptLoadMoreStepBytes = 4 * 1024 * 1024
   private static let maxCodexTranscriptTailBytes = 64 * 1024 * 1024
+  private static let codexQueueSendBatchMaxCount = 4
+  private static let codexQueueSteerBatchMaxCount = 8
+  private static let codexQueueSendBatchMaxBytes = 256 * 1024
+  private static let codexQueueSteerBatchMaxBytes = 96 * 1024
 
   private static let fileSizeFormatter: ByteCountFormatter = {
     let formatter = ByteCountFormatter()
@@ -435,7 +441,8 @@ final class AppModel: ObservableObject {
     }
     return codexPromptQueue.contains { item in
       item.sessionID == activeSessionID
-        && (item.status == .queued || item.status == .sending || item.status == .waitingForCodex)
+        && item.status == .waitingForCodex
+        && item.lastError.localizedCaseInsensitiveContains("Processing on A")
     }
   }
 
@@ -636,6 +643,17 @@ final class AppModel: ObservableObject {
     guard !value.trimmed.isEmpty else { return }
     try? value.write(
       to: transcriptURL(for: kind, sessionID: sessionID), atomically: true, encoding: .utf8)
+  }
+
+  private func persistBackgroundTranscript(_ kind: TranscriptKind, value: String, sessionID: UUID) {
+    guard !value.trimmed.isEmpty else { return }
+    let url = transcriptURL(for: kind, sessionID: sessionID)
+    let newByteCount = value.lengthOfBytes(using: .utf8)
+    let existingByteCount =
+      ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? NSNumber)?
+      .intValue ?? 0
+    guard existingByteCount == 0 || newByteCount + 256_000 >= existingByteCount else { return }
+    try? value.write(to: url, atomically: true, encoding: .utf8)
   }
 
   private func normalizedCodexTurnText(_ value: String) -> String {
@@ -1349,11 +1367,30 @@ final class AppModel: ObservableObject {
       })
     else { return }
     var items = codexPromptQueue
+    if shouldRetryFailedSteerAsSend(items[index]) {
+      items[index].kind = .send
+      items[index].displayText = items[index].displayText ?? items[index].visibleText
+    }
     items[index].status = .queued
     items[index].lastError = ""
+    items[index].remoteQueueID = nil
     items[index].updatedAt = Date()
     codexPromptQueue = items
     processCodexPromptQueue()
+  }
+
+  private func shouldRetryFailedSteerAsSend(_ item: CodexPromptQueueItem) -> Bool {
+    guard item.kind == .steer else { return false }
+    let detail = item.lastError.lowercased()
+    if detail.contains("not currently working")
+      || detail.contains("use send")
+      || detail.contains("send for a new prompt")
+      || detail.contains("send_failed exit=65")
+    {
+      return true
+    }
+    guard let sessionID = item.sessionID else { return false }
+    return !codexWorkingSessionIDs.contains(sessionID)
   }
 
   func processCodexPromptQueue() {
@@ -1372,8 +1409,13 @@ final class AppModel: ObservableObject {
     where items[index].sessionID == activeSessionID
       && items[index].status == .failed
     {
+      if shouldRetryFailedSteerAsSend(items[index]) {
+        items[index].kind = .send
+        items[index].displayText = items[index].displayText ?? items[index].visibleText
+      }
       items[index].status = .queued
       items[index].lastError = ""
+      items[index].remoteQueueID = nil
       items[index].updatedAt = Date()
       changed = true
     }
@@ -2759,7 +2801,7 @@ final class AppModel: ObservableObject {
     let candidates = Array(
       sessions
         .filter { !$0.codexHistoryID.trimmed.isEmpty }
-        .filter { codexSessionWarmScore($0) >= 500 }
+        .filter { codexSessionWarmScore($0) >= 120 }
         .sorted { first, second in
           let firstScore = codexSessionWarmScore(first)
           let secondScore = codexSessionWarmScore(second)
@@ -2768,7 +2810,7 @@ final class AppModel: ObservableObject {
           }
           return first.updatedAt > second.updatedAt
         }
-        .prefix(force ? 4 : 3)
+        .prefix(force ? 6 : 5)
     )
     guard !candidates.isEmpty else { return }
     isWarmingRecentCodexSessions = true
@@ -2826,12 +2868,18 @@ final class AppModel: ObservableObject {
       title: session.codexHistoryTitle,
       host: session.codexHistoryHost
     )
-    let result = await codexHistoryTranscriptBackgroundResult(for: record)
+    let tailBytes =
+      activeSessionID == session.id
+      ? (codexTranscriptTailBytesByHistoryID[session.codexHistoryID.trimmed]
+        ?? Self.defaultCodexTranscriptTailBytes)
+      : Self.backgroundCodexTranscriptTailBytes
+    let result = await codexHistoryTranscriptBackgroundResult(for: record, tailBytes: tailBytes)
     guard result.exitCode == 0, !result.output.trimmed.isEmpty else { return }
     if activeSessionID == session.id {
+      updateCodexTranscriptWindowState(from: result.output, record: record, tailBytes: tailBytes)
       applyCodexTranscriptResult(result)
     } else {
-      persistTranscript(.codex, value: result.output, sessionID: session.id)
+      persistBackgroundTranscript(.codex, value: result.output, sessionID: session.id)
     }
   }
 
@@ -3901,17 +3949,18 @@ final class AppModel: ObservableObject {
       codexModel = "gpt-5.5"
     }
     ensureConversationSession(defaultTool: .codex)
-    if steer, !activeCodexCanSteer {
+    let shouldSteer = steer || (!steer && activeCodexCanSteer)
+    if shouldSteer, !activeCodexCanSteer {
       statusText = "Send first, then steer the running or A-queued task · \(Date().shortStamp)"
       return false
     }
     enableToolForActiveSession(.codex, touch: true)
     let item = addCodexQueueItem(
-      kind: steer ? .steer : .send,
+      kind: shouldSteer ? .steer : .send,
       text: text,
       displayText: displayText
     )
-    if steer {
+    if shouldSteer {
       appendCodexLocalTurnBlock(
         codexQueueBlock(for: visibleQueueItem(item), includeStatus: false),
         preserveThroughCapture: true
@@ -3920,7 +3969,7 @@ final class AppModel: ObservableObject {
     codexInput = ""
     codexAttachments.removeAll()
     statusText =
-      steer
+      shouldSteer
       ? "Queueing steer on A · \(Date().shortStamp)"
       : "Queueing prompt on A · \(Date().shortStamp)"
     startCodexTranscriptAutoRefresh()
@@ -4001,19 +4050,41 @@ final class AppModel: ObservableObject {
     }
   }
 
-  private func nextCodexQueueBatchToDeliver(maxCount: Int = 24) -> [CodexPromptQueueItem] {
+  private func nextCodexQueueBatchToDeliver() -> [CodexPromptQueueItem] {
     let queued = codexPromptQueue
       .filter { item in
         item.status == .queued
       }
     let sorted = queued.sorted(by: codexQueueDeliveryPrecedes)
     guard let first = sorted.first else { return [] }
-    return Array(
-      queued
-        .filter { $0.sessionID == first.sessionID }
-        .sorted(by: codexQueueDeliveryPrecedes)
-        .prefix(maxCount)
-    )
+    let maxCount =
+      first.kind == .steer ? Self.codexQueueSteerBatchMaxCount : Self.codexQueueSendBatchMaxCount
+    let maxBytes =
+      first.kind == .steer ? Self.codexQueueSteerBatchMaxBytes : Self.codexQueueSendBatchMaxBytes
+    var batch: [CodexPromptQueueItem] = []
+    var byteCount = 0
+    for item in queued
+      .filter({ $0.sessionID == first.sessionID && $0.kind == first.kind })
+      .sorted(by: codexQueueDeliveryPrecedes)
+    {
+      let itemBytes = estimatedCodexQueueItemBytes(item)
+      guard batch.isEmpty || (batch.count < maxCount && byteCount + itemBytes <= maxBytes) else {
+        break
+      }
+      batch.append(item)
+      byteCount += itemBytes
+    }
+    return batch
+  }
+
+  private func estimatedCodexQueueItemBytes(_ item: CodexPromptQueueItem) -> Int {
+    let promptBytes = item.text.lengthOfBytes(using: .utf8)
+    let attachmentBytes = item.attachments.reduce(0) { partial, attachment in
+      let bounded = min(max(attachment.size, 0), Int64(Int.max - partial))
+      return partial + Int(bounded)
+    }
+    guard attachmentBytes <= Int.max - promptBytes else { return Int.max }
+    return promptBytes + attachmentBytes
   }
 
   private func codexQueueDeliveryPrecedes(
@@ -4105,7 +4176,7 @@ final class AppModel: ObservableObject {
     }
     let remoteIDs = codexAQueueBatchIDs(from: result)
     startCodexTranscriptAutoRefresh()
-    statusText = "Codex batch queued on A · \(Date().shortStamp)"
+    statusText = "Codex \(jobs.count)x \(first.kind.title.lowercased()) queued on A · \(Date().shortStamp)"
     for item in batch where jobs.contains(where: { $0.clientID == item.id.uuidString }) {
       let remoteQueueID = remoteIDs[item.id.uuidString]
       updateCodexQueueItem(
@@ -4355,10 +4426,7 @@ final class AppModel: ObservableObject {
     guard !historyID.isEmpty else { return }
     let currentBytes =
       codexTranscriptTailBytesByHistoryID[historyID] ?? Self.defaultCodexTranscriptTailBytes
-    let nextBytes = min(
-      max(currentBytes * 2, Self.defaultCodexTranscriptTailBytes * 2),
-      Self.maxCodexTranscriptTailBytes
-    )
+    let nextBytes = min(currentBytes + Self.codexTranscriptLoadMoreStepBytes, Self.maxCodexTranscriptTailBytes)
     guard nextBytes > currentBytes || codexTranscriptCanLoadMore else { return }
     isLoadingMoreCodexTranscript = true
     statusText = "Loading older transcript · \(Date().shortStamp)"
@@ -4403,19 +4471,33 @@ final class AppModel: ObservableObject {
       environmentOverride: environment.isEmpty ? nil : environment)
   }
 
-  private func codexHistoryTranscriptBackgroundResult(for record: CodexHistoryRecord) async
+  private func codexHistoryTranscriptBackgroundResult(
+    for record: CodexHistoryRecord,
+    tailBytes: Int? = nil
+  ) async
     -> CommandResult
   {
+    var environment: [String: String] = [:]
+    if let tailBytes {
+      environment["A_COCKPIT_CODEX_TRANSCRIPT_TAIL_BYTES"] =
+        "\(min(max(tailBytes, 1_048_576), Self.maxCodexTranscriptTailBytes))"
+    }
     if record.normalizedHost == "local" {
       return await runLocalHelper(
         "codex-history-transcript",
         args: [record.id],
         input: record.path + "\n",
-        timeout: 16
+        timeout: 16,
+        environment: environment
       )
     }
     return await runRemoteBackground(
-      "codex-history-transcript", args: [record.id], input: record.path + "\n", timeout: 16)
+      "codex-history-transcript",
+      args: [record.id],
+      input: record.path + "\n",
+      timeout: 16,
+      environmentOverride: environment.isEmpty ? nil : environment
+    )
   }
 
   private func updateCodexTranscriptWindowState(

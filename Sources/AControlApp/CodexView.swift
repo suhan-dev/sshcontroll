@@ -1074,6 +1074,13 @@ private struct CodexPromptPanel: View {
             .frame(minWidth: 0, maxWidth: 1040, alignment: .trailing)
             .layoutPriority(3)
 
+            CodexGoalRuntimeControls(
+              markGoal: { markDraftAsGoal() },
+              refreshStatus: { Task { await model.codexSlash("/status") } },
+              pause: { Task { await model.codexKey("esc") } },
+              resume: { Task { await model.codexKey("enter") } }
+            )
+
             AgentChoiceControls(
               onUp: { Task { await model.codexKey("up") } },
               onDown: { Task { await model.codexKey("down") } },
@@ -1160,6 +1167,17 @@ private struct CodexPromptPanel: View {
       draftSaveTask?.cancel()
       model.updateCodexDraftForActiveSession(draft)
     }
+  }
+
+  private func markDraftAsGoal() {
+    let clean = draft.trimmed
+    guard !clean.isEmpty else {
+      draft = "Pursue this goal: "
+      return
+    }
+    let lower = clean.lowercased()
+    guard !lower.hasPrefix("pursue this goal:") && !lower.hasPrefix("goal:") else { return }
+    draft = "Pursue this goal:\n\(clean)"
   }
 
   private var steerSubmitButton: some View {
@@ -1691,6 +1709,47 @@ struct AgentChoiceControls: View {
       Image(systemName: symbol)
         .font(.system(size: 12.5, weight: .semibold))
         .frame(width: 28, height: 28)
+        .contentShape(Circle())
+    }
+    .buttonStyle(ImmediateFeedbackButtonStyle())
+    .foregroundStyle(.primary)
+    .background(Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.045), in: Circle())
+    .safeHelp(help)
+  }
+}
+
+private struct CodexGoalRuntimeControls: View {
+  @Environment(\.colorScheme) private var colorScheme
+  var markGoal: () -> Void
+  var refreshStatus: () -> Void
+  var pause: () -> Void
+  var resume: () -> Void
+
+  var body: some View {
+    HStack(spacing: 4) {
+      controlButton("target", title: "Goal", help: "Mark the current draft as a goal", action: markGoal)
+      controlButton("gauge", title: "Status", help: "Refresh Codex status, limits, and goal state", action: refreshStatus)
+      controlButton("pause.fill", title: "Pause", help: "Pause or interrupt the active Codex goal/work", action: pause)
+      controlButton("play.fill", title: "Resume", help: "Resume or confirm the active Codex goal/work", action: resume)
+    }
+    .padding(4)
+    .background(AControlStyle.insetFill(colorScheme), in: Capsule())
+    .overlay {
+      Capsule().strokeBorder(AControlStyle.hairline(colorScheme), lineWidth: 1)
+    }
+  }
+
+  private func controlButton(
+    _ symbol: String,
+    title: String,
+    help: String,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      Label(title, systemImage: symbol)
+        .labelStyle(.iconOnly)
+        .font(.system(size: 12, weight: .semibold))
+        .frame(width: 27, height: 27)
         .contentShape(Circle())
     }
     .buttonStyle(ImmediateFeedbackButtonStyle())
