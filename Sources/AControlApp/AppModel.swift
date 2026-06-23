@@ -34,6 +34,7 @@ final class AppModel: ObservableObject {
   private static let codexQueueSteerBatchMaxCount = 8
   private static let codexQueueSendBatchMaxBytes = 256 * 1024
   private static let codexQueueSteerBatchMaxBytes = 96 * 1024
+  private static let staleIdleSteerRecoverySeconds: TimeInterval = 18
 
   private static let fileSizeFormatter: ByteCountFormatter = {
     let formatter = ByteCountFormatter()
@@ -1095,7 +1096,17 @@ final class AppModel: ObservableObject {
         markCodexQueueItemDelivered(current)
       case "failed":
         let error = codexQueueWorkerLogTail(from: combined) ?? "A queue worker failed."
-        updateCodexQueueItem(item.id, status: .failed, error: error)
+        var failed = current
+        failed.lastError = error
+        if shouldRetryFailedSteerAsSend(failed) {
+          resetCodexQueueItemAsSend(
+            item.id,
+            detail: "Recovered stale steer as Send"
+          )
+          processCodexPromptQueue()
+        } else {
+          updateCodexQueueItem(item.id, status: .failed, error: error)
+        }
       case "queued":
         updateCodexQueueProgress(item.id, detail: "Queued on A")
       case "processing":
@@ -1106,6 +1117,7 @@ final class AppModel: ObservableObject {
         }
       }
     }
+    await recoverIdleSteerQueueItemsAsSend()
   }
 
   private func updateCodexQueueProgress(_ id: UUID, detail: String) {
@@ -1113,6 +1125,23 @@ final class AppModel: ObservableObject {
     var items = codexPromptQueue
     guard items[index].lastError != detail else { return }
     items[index].lastError = detail
+    items[index].updatedAt = Date()
+    codexPromptQueue = items
+    scheduleCodexTranscriptAnalysis(force: true)
+  }
+
+  private func resetCodexQueueItemAsSend(
+    _ id: UUID,
+    status: CodexPromptQueueStatus = .queued,
+    detail: String = ""
+  ) {
+    guard let index = codexPromptQueue.firstIndex(where: { $0.id == id }) else { return }
+    var items = codexPromptQueue
+    items[index].kind = .send
+    items[index].displayText = items[index].displayText ?? items[index].visibleText
+    items[index].status = status
+    items[index].lastError = detail
+    items[index].remoteQueueID = nil
     items[index].updatedAt = Date()
     codexPromptQueue = items
     scheduleCodexTranscriptAnalysis(force: true)
@@ -1242,6 +1271,99 @@ final class AppModel: ObservableObject {
       statusText = "This prompt is already being uploaded · \(Date().shortStamp)"
     case .delivered, .failed:
       return
+    }
+  }
+
+  func demoteCodexQueueItemToSend(_ id: UUID) {
+    guard let index = codexPromptQueue.firstIndex(where: { $0.id == id && $0.kind == .steer })
+    else { return }
+    let item = codexPromptQueue[index]
+    switch item.status {
+    case .queued:
+      resetCodexQueueItemAsSend(id)
+      statusText = "Queued steer changed to Send · \(Date().shortStamp)"
+      processCodexPromptQueue()
+    case .waitingForCodex:
+      guard let remoteQueueID = item.remoteQueueID?.trimmed, !remoteQueueID.isEmpty else {
+        resetCodexQueueItemAsSend(id)
+        statusText = "Queued steer changed to Send · \(Date().shortStamp)"
+        processCodexPromptQueue()
+        return
+      }
+      statusText = "Changing A queued steer to Send · \(Date().shortStamp)"
+      let sessionID = item.sessionID
+      Task { [weak self] in
+        await self?.demoteAQueuedCodexItemToSend(
+          id: id,
+          remoteQueueID: remoteQueueID,
+          sessionID: sessionID
+        )
+      }
+    case .failed:
+      retryCodexQueueItem(id)
+    case .sending, .delivered:
+      return
+    }
+  }
+
+  private func demoteAQueuedCodexItemToSend(
+    id: UUID,
+    remoteQueueID: String,
+    sessionID: UUID?
+  ) async {
+    let cancelled = await cancelAQueuedCodexItem(
+      remoteQueueID: remoteQueueID,
+      sessionID: sessionID
+    )
+    guard codexPromptQueue.contains(where: { $0.id == id }) else { return }
+    guard cancelled else {
+      statusText = "A queue item is already processing · \(Date().shortStamp)"
+      updateCodexQueueProgress(id, detail: "Already processing on A")
+      return
+    }
+    resetCodexQueueItemAsSend(id)
+    statusText = "Queued steer changed to Send · \(Date().shortStamp)"
+    processCodexPromptQueue()
+    if sessionID == activeSessionID {
+      await captureCodexIfUseful(force: false)
+    }
+  }
+
+  private func recoverIdleSteerQueueItemsAsSend() async {
+    let now = Date()
+    let candidates = codexPromptQueue.filter { item in
+      guard item.kind == .steer, item.status == .waitingForCodex else { return false }
+      guard item.remoteQueueID?.trimmed.isEmpty == false else { return false }
+      guard now.timeIntervalSince(item.createdAt) >= Self.staleIdleSteerRecoverySeconds else {
+        return false
+      }
+      let detail = item.lastError.lowercased()
+      guard detail.contains("queued on a") || detail.contains("a queue") else { return false }
+      return shouldRetryFailedSteerAsSend(item)
+    }
+    guard !candidates.isEmpty else { return }
+    var recovered = 0
+    for item in candidates.prefix(4) {
+      guard let remoteQueueID = item.remoteQueueID?.trimmed, !remoteQueueID.isEmpty else {
+        resetCodexQueueItemAsSend(item.id)
+        recovered += 1
+        continue
+      }
+      let cancelled = await cancelAQueuedCodexItem(
+        remoteQueueID: remoteQueueID,
+        sessionID: item.sessionID
+      )
+      if cancelled {
+        resetCodexQueueItemAsSend(
+          item.id,
+          detail: "Recovered idle steer as Send"
+        )
+        recovered += 1
+      }
+    }
+    if recovered > 0 {
+      statusText = "Recovered \(recovered) idle steer as Send · \(Date().shortStamp)"
+      processCodexPromptQueue()
     }
   }
 
@@ -4023,7 +4145,7 @@ final class AppModel: ObservableObject {
       codexModel = "gpt-5.5"
     }
     ensureConversationSession(defaultTool: .codex)
-    let shouldSteer = steer || (!steer && activeCodexCanSteer)
+    let shouldSteer = steer
     if shouldSteer, !activeCodexCanSteer {
       statusText = "Send first, then steer the running or A-queued task · \(Date().shortStamp)"
       return false

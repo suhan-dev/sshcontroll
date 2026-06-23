@@ -7,9 +7,10 @@ struct RootView: View {
   @State private var renamingSession: SessionCard?
   @State private var renameText = ""
   @State private var expandedSidebarProjectIDs: Set<String> = []
+  @State private var sidebarProjectVisibleLimits: [String: Int] = [:]
   @State private var sidebarSearchText = ""
 
-  private let collapsedProjectSessionLimit = 10
+  private let sidebarProjectSessionPageSize = 10
 
   var body: some View {
     GeometryReader { proxy in
@@ -229,10 +230,15 @@ struct RootView: View {
   private func sidebarProjectSection(_ group: SidebarProjectGroup) -> some View {
     let isSearching = !sidebarSearchText.trimmed.isEmpty
     let isExpanded = isSearching || expandedSidebarProjectIDs.contains(group.id)
+    let visibleLimit =
+      isSearching
+      ? group.sessions.count
+      : min(group.sessions.count, sidebarProjectVisibleLimits[group.id] ?? sidebarProjectSessionPageSize)
     let visibleSessions =
       isExpanded
-      ? group.sessions
-      : Array(group.sessions.prefix(collapsedProjectSessionLimit))
+      ? Array(group.sessions.prefix(visibleLimit))
+      : []
+    let remainingSessionCount = max(0, group.sessions.count - visibleLimit)
     return VStack(alignment: .leading, spacing: 4) {
       SidebarProjectHeaderRow(
         title: group.title,
@@ -272,11 +278,11 @@ struct RootView: View {
         }
       }
 
-      if group.sessions.count > collapsedProjectSessionLimit && !isSearching {
+      if isExpanded, remainingSessionCount > 0, !isSearching {
         Button {
-          toggleSidebarProjectExpansion(group.id)
+          showMoreSidebarProjectSessions(group.id, total: group.sessions.count)
         } label: {
-          Text(isExpanded ? "Show less" : "Show \(group.sessions.count - collapsedProjectSessionLimit) more")
+          Text("Show \(min(sidebarProjectSessionPageSize, remainingSessionCount)) more")
             .font(.system(size: 12.5, weight: .medium))
             .foregroundStyle(.secondary)
             .padding(.leading, 30)
@@ -293,8 +299,17 @@ struct RootView: View {
     if expandedSidebarProjectIDs.contains(id) {
       expandedSidebarProjectIDs.remove(id)
     } else {
+      if sidebarProjectVisibleLimits[id] == nil {
+        sidebarProjectVisibleLimits[id] = sidebarProjectSessionPageSize
+      }
       expandedSidebarProjectIDs.insert(id)
     }
+  }
+
+  private func showMoreSidebarProjectSessions(_ id: String, total: Int) {
+    let current = sidebarProjectVisibleLimits[id] ?? sidebarProjectSessionPageSize
+    sidebarProjectVisibleLimits[id] = min(total, current + sidebarProjectSessionPageSize)
+    expandedSidebarProjectIDs.insert(id)
   }
 
   private func sidebarProjectID(for rawPath: String) -> String {

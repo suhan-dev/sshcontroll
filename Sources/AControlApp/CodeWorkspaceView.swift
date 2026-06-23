@@ -984,6 +984,11 @@ private struct CodeWorkspaceQueueRow: View {
           model.promoteCodexQueueItemToSteer(item.id)
         }
       }
+      if item.kind == .steer && (item.status == .queued || item.status == .waitingForCodex) {
+        queueButton("paperplane", help: "Convert to Send") {
+          model.demoteCodexQueueItemToSend(item.id)
+        }
+      }
       if item.status == .failed {
         queueButton("arrow.clockwise", help: "Retry") {
           model.retryCodexQueueItem(item.id)
