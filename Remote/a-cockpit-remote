@@ -5233,8 +5233,6 @@ if state_db.exists():
                 source = str(source or "")
                 thread_source = str(thread_source or "")
                 agent_role = str(agent_role or "")
-                if thread_source.lower() == "subagent" or "subagent" in source.lower():
-                    continue
                 is_auto_thread = is_automation_meta(source, thread_source, agent_role)
                 sqlite_meta[session_id] = {
                     "source": source,
@@ -5367,13 +5365,9 @@ for _, path, stat in scan_paths:
     meta_thread_source = str(meta.get("thread_source") or "")
     meta_source_value = meta.get("source")
     meta_source = meta_source_value if isinstance(meta_source_value, str) else json.dumps(meta_source_value or "", ensure_ascii=False)
-    if meta_thread_source.lower() == "subagent" or "subagent" in meta_source.lower():
-        continue
     sqlite_session_id = sqlite_paths.get(str(path), "")
     sqlite_title = sqlite_titles.get(session_id) or sqlite_titles.get(sqlite_session_id)
     meta_source = sqlite_meta.get(session_id) or sqlite_meta.get(sqlite_session_id) or {}
-    if str(meta_source.get("thread_source") or "").lower() == "subagent" or "subagent" in str(meta_source.get("source") or "").lower():
-        continue
     indexed_title = index_titles.get(session_id) or index_titles.get(sqlite_session_id)
     latest_user_title = latest_user_title_from_path(path)
     selected_title = choose_best_title(
@@ -5741,8 +5735,6 @@ if state_db.exists():
                 "select id, rollout_path, coalesce(updated_at,0), "
                 "coalesce(cwd,''), coalesce(title,''), coalesce(source,''), coalesce(thread_source,'') "
                 "from threads where coalesce(archived,0)=0 "
-                "and lower(coalesce(thread_source,'')) != 'subagent' "
-                "and lower(coalesce(source,'')) not like '%subagent%' "
                 "order by updated_at desc limit ?"
             )
             for session_id, rollout_path, updated_at, cwd, title, source, thread_source in conn.execute(

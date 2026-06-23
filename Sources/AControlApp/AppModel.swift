@@ -3371,7 +3371,7 @@ final class AppModel: ObservableObject {
       $0.normalizedHost == "remote"
     }
     let visibleRecords = mergedCodexHistoryRecords(records).filter {
-      !isCodexHistoryTombstoned($0.id) && !$0.isSubagent
+      !isCodexHistoryTombstoned($0.id)
     }
     guard !visibleRecords.isEmpty || remoteResult.exitCode == 0 else {
       if prunedLocalSessions {
@@ -3700,7 +3700,7 @@ final class AppModel: ObservableObject {
       let currentDir = normalizedRemotePath(currentRemoteDir)
       for record in codexHistoryRecords {
         let historyID = record.id.trimmed
-        guard !record.isSubagent, !historyID.isEmpty, !existingIDs.contains(historyID),
+        guard !historyID.isEmpty, !existingIDs.contains(historyID),
           !isCodexHistoryTombstoned(historyID)
         else { continue }
         let remoteDir = normalizedRemotePath(
