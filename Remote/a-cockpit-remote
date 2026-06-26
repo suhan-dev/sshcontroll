@@ -624,9 +624,12 @@ ensure_codex() {
     exit 127
   fi
   if ! tmux has-session -t "$CODEX_SESSION" 2>/dev/null; then
-    tmux new-session -d -s "$CODEX_SESSION" -c "$(session_start_dir)" "$CODEX_BIN"
+    local dir
+    dir="$(session_start_dir)"
+    tmux new-session -d -s "$CODEX_SESSION" -c "$HOME" "$CODEX_BIN" -C "$dir"
     codex_mark_history ""
     codex_mark_runtime "interactive-full"
+    codex_mark_dir "$dir"
   fi
 }
 
@@ -2358,14 +2361,24 @@ refresh_monitor() {
 
 wait_for_codex_input_ready() {
   local target="$1"
+  local max_attempts="${2:-120}"
   local attempt
   local pane_text
   local bottom_text
   local lower
-  for attempt in {1..50}; do
+  [[ "$max_attempts" == <-> ]] || max_attempts=120
+  for (( attempt = 1; attempt <= max_attempts; attempt++ )); do
+    if ! tmux has-session -t "$target" 2>/dev/null; then
+      sleep 0.15
+      continue
+    fi
     pane_text="$(tmux capture-pane -pJ -t "$target" -S -50 2>/dev/null || true)"
     bottom_text="$(print -r -- "$pane_text" | tail -24)"
     lower="$(print -r -- "$bottom_text" | tr '[:upper:]' '[:lower:]')"
+    if codex_queue_accept_startup_prompt "$bottom_text" "$target"; then
+      sleep 0.8
+      continue
+    fi
     if [[ "$lower" == *"do you trust the contents of this directory"* || "$lower" == *"press enter to continue"* ]]; then
       tmux send-keys -t "$target" Enter 2>/dev/null || true
       sleep 0.6
@@ -2377,7 +2390,7 @@ wait_for_codex_input_ready() {
     if [[ "$bottom_text" == *"›"* || "$lower" == *"model:"* || "$lower" == *"directory:"* ]]; then
       return 0
     fi
-    sleep 0.12
+    sleep 0.15
   done
   return 1
 }
@@ -2407,9 +2420,14 @@ paste_stdin_and_enter() {
   if [[ "$mode" == "codex" ]]; then
     pane_text="$(tmux capture-pane -pJ -t "$target" -S -30 2>/dev/null || true)"
     if [[ "$pane_text" == *"Approaching rate limits"* || "$pane_text" == *"Press enter to confirm or esc to go back"* || "$pane_text" == *"Switch to gpt-"* || "$pane_text" == *"Do you trust the contents of this directory"* ]]; then
-      rm -f "$tmp_file"
-      echo "Codex is showing an interactive choice. Pick an option in the live Codex terminal first, then send again." >&2
-      exit 65
+      if codex_queue_accept_startup_prompt "$pane_text" "$target"; then
+        sleep 0.8
+        pane_text="$(tmux capture-pane -pJ -t "$target" -S -30 2>/dev/null || true)"
+      else
+        rm -f "$tmp_file"
+        echo "Codex is showing an interactive choice. Pick an option in the live Codex terminal first, then send again." >&2
+        exit 65
+      fi
     fi
     if codex_queue_pane_is_busy "$pane_text"; then
       busy=1
@@ -2640,6 +2658,22 @@ codex_queue_pane_is_interactive() {
     || "$pane_text" == *"Switch to gpt-"* ]]
 }
 
+codex_queue_accept_startup_prompt() {
+  local pane_text="$1"
+  local target="${2:-$CODEX_SESSION}"
+  local lower
+  lower="$(print -r -- "$pane_text" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$lower" == *"resume paused goal?"* && "$lower" == *"leave paused"* ]]; then
+    tmux send-keys -t "$target" Down Enter 2>/dev/null || true
+    return 0
+  fi
+  if [[ "$lower" == *"do you trust the contents of this directory"* ]]; then
+    tmux send-keys -t "$target" Enter 2>/dev/null || true
+    return 0
+  fi
+  return 1
+}
+
 codex_queue_pane_needs_recovery() {
   local pane_text="$1"
   local lower
@@ -2733,6 +2767,24 @@ codex_queue_worker_heartbeat_file() {
   print -r -- "$root/worker.heartbeat"
 }
 
+codex_queue_worker_version_file() {
+  local root="$1"
+  print -r -- "$root/worker.version"
+}
+
+codex_queue_worker_version() {
+  local script_path stamp size
+  script_path="${SCRIPT_PATH:-$0}"
+  stamp="$(stat -f '%m' "$script_path" 2>/dev/null || print -r -- 0)"
+  size="$(stat -f '%z' "$script_path" 2>/dev/null || print -r -- 0)"
+  print -r -- "$stamp:$size"
+}
+
+codex_queue_mark_worker_version() {
+  local root="$1"
+  print -r -- "$(codex_queue_worker_version)" > "$(codex_queue_worker_version_file "$root")" 2>/dev/null || true
+}
+
 codex_queue_touch_worker_heartbeat() {
   local root="$1"
   print -r -- "$(date +%s)" > "$(codex_queue_worker_heartbeat_file "$root")" 2>/dev/null || true
@@ -2757,6 +2809,16 @@ codex_queue_pending_count() {
   print -r -- "$(( queued_count + processing_count ))"
 }
 
+codex_queue_requeue_processing_jobs() {
+  local root="$1"
+  local job
+  local -a processing_jobs
+  processing_jobs=("$root"/processing/*(N/))
+  for job in "${processing_jobs[@]}"; do
+    mv "$job" "$root/queued/${job:t}" 2>/dev/null || true
+  done
+}
+
 codex_queue_worker_state() {
   local root="$1"
   local worker="$2"
@@ -2775,23 +2837,33 @@ codex_queue_worker_state() {
 }
 
 codex_queue_worker_start() {
-  local root worker command pending_count heartbeat_age
+  local root worker command pending_count heartbeat_age current_version recorded_version restart_reason
   root="$(codex_queue_root)"
   worker="$(codex_queue_worker_session)"
   codex_queue_prepare_dirs "$root"
   need_tmux
+  current_version="$(codex_queue_worker_version)"
   if tmux has-session -t "$worker" 2>/dev/null; then
     pending_count="$(codex_queue_pending_count "$root")"
     heartbeat_age="$(codex_queue_worker_heartbeat_age "$root")"
-    if (( pending_count > 0 && heartbeat_age > 45 )); then
-      codex_queue_log "$root" "worker_stale_restart session=$worker age=$heartbeat_age pending=$pending_count"
+    recorded_version="$(cat "$(codex_queue_worker_version_file "$root")" 2>/dev/null || true)"
+    restart_reason=""
+    if [[ "$recorded_version" != "$current_version" ]]; then
+      restart_reason="version_changed"
+    elif (( pending_count > 0 && heartbeat_age > 45 )); then
+      restart_reason="heartbeat_stale"
+    fi
+    if [[ -n "$restart_reason" ]]; then
+      codex_queue_log "$root" "worker_restart session=$worker reason=$restart_reason age=$heartbeat_age pending=$pending_count"
       tmux kill-session -t "$worker" 2>/dev/null || true
+      codex_queue_requeue_processing_jobs "$root"
       sleep 0.12
     else
       return 0
     fi
   fi
   rm -f "$(codex_queue_worker_heartbeat_file "$root")" 2>/dev/null || true
+  codex_queue_mark_worker_version "$root"
   command="A_COCKPIT_CODEX_SESSION=${(q)CODEX_SESSION} A_COCKPIT_SESSION_DIR=${(q)SESSION_DIR} A_COCKPIT_STATE_DIR=${(q)STATE_DIR} A_COCKPIT_CODEX_QUEUE_CONTEXT=1 A_COCKPIT_CODEX_QUEUE_PLUGIN_MODE=${(q)CODEX_QUEUE_PLUGIN_MODE}"
   if [[ -n "$CODEX_BIN" ]]; then
     command="$command A_COCKPIT_CODEX_BIN=${(q)CODEX_BIN}"
@@ -3201,6 +3273,11 @@ codex_queue_worker() {
       fi
     fi
     if [[ "$interactive" == "1" ]]; then
+      if codex_queue_accept_startup_prompt "$pane_text" "$CODEX_SESSION"; then
+        codex_queue_log "$root" "accepted_startup_prompt id=$job_id"
+        sleep 2
+        continue
+      fi
       codex_queue_log "$root" "waiting_interactive_choice id=$job_id"
       sleep 5
       continue
@@ -3251,11 +3328,24 @@ codex_queue_worker() {
 
     local send_epoch
     send_epoch="$(date +%s)"
+    acq_sent_kind="$job_kind"
     if [[ "$acq_job_is_steer" == "1" ]]; then
-      if ( cat "$job/prompt.txt" | steer_codex ) >> "$job/worker.log" 2>&1; then
-        result=0
+      pane_text="$(codex_queue_pane_text "$CODEX_SESSION")"
+      if codex_queue_pane_is_busy "$pane_text"; then
+        if ( cat "$job/prompt.txt" | steer_codex ) >> "$job/worker.log" 2>&1; then
+          result=0
+        else
+          result=$?
+        fi
       else
-        result=$?
+        acq_sent_kind="send"
+        codex_queue_log "$root" "steer_demoted_to_send_idle id=$job_id"
+        print -r -- "steer_demoted_to_send_idle: Codex was idle at delivery time, so the prompt was sent as a normal prompt." >> "$job/worker.log" 2>/dev/null || true
+        if ( cat "$job/prompt.txt" | paste_stdin_and_enter "$CODEX_SESSION" codex queue ) >> "$job/worker.log" 2>&1; then
+          result=0
+        else
+          result=$?
+        fi
       fi
     elif [[ "$started_with_initial_prompt" == "1" ]]; then
       result=0
@@ -3304,8 +3394,6 @@ codex_queue_worker() {
       print -r -- "$(date '+%Y-%m-%dT%H:%M:%S%z')" > "$job/sent_at"
       mkdir -p "$root/done"
       mv "$job" "$root/done/$job_id" 2>/dev/null || true
-      acq_sent_kind="send"
-      [[ "$acq_job_is_steer" == "1" ]] && acq_sent_kind="steer"
       codex_queue_log "$root" "sent id=$job_id kind=$acq_sent_kind"
     else
       codex_queue_fail_job "$root" "$job" "send_failed exit=$result"
@@ -3477,7 +3565,7 @@ codex_queue_recover_codex_session() {
   if [[ -n "$history_id" ]]; then
     codex_args=("$CODEX_BIN" "resume" "$history_id" "-C" "$dir")
   else
-    codex_args=("$CODEX_BIN")
+    codex_args=("$CODEX_BIN" "-C" "$dir")
   fi
   if [[ -n "$model" ]]; then
     codex_args+=("-m" "$model")
@@ -3486,9 +3574,14 @@ codex_queue_recover_codex_session() {
     codex_args+=("-c" "model_reasoning_effort=\"$effort\"")
   fi
   codex_add_runtime_args_if_needed
-  tmux new-session -d -s "$CODEX_SESSION" -c "$dir" "${codex_args[@]}"
+  tmux new-session -d -s "$CODEX_SESSION" -c "$HOME" "${codex_args[@]}"
   codex_mark_history "$history_id"
   codex_mark_runtime "$(codex_runtime_mode_label)"
+  codex_mark_dir "$dir"
+  if ! wait_for_codex_input_ready "$CODEX_SESSION" 160; then
+    echo "$CODEX_SESSION did not become ready after Codex recovery" >&2
+    return 70
+  fi
   echo "$CODEX_SESSION recovered in $dir${history_id:+ with Codex history $history_id}"
 }
 
@@ -3504,6 +3597,12 @@ codex_runtime_marker_file() {
   print -r -- "$STATE_DIR/codex-session-runtime/$safe"
 }
 
+codex_session_dir_marker_file() {
+  local safe
+  safe="$(codex_queue_safe_name "$CODEX_SESSION")"
+  print -r -- "$STATE_DIR/codex-session-dir/$safe"
+}
+
 codex_current_history_marker() {
   local marker_file
   marker_file="$(codex_history_marker_file)"
@@ -3514,6 +3613,23 @@ codex_current_runtime_marker() {
   local marker_file
   marker_file="$(codex_runtime_marker_file)"
   [[ -f "$marker_file" ]] && cat "$marker_file" || true
+}
+
+codex_current_dir_marker() {
+  local marker_file dir
+  marker_file="$(codex_session_dir_marker_file)"
+  dir="$([[ -f "$marker_file" ]] && cat "$marker_file" || true)"
+  [[ -n "$dir" && -d "$dir" ]] && print -r -- "$dir" || true
+}
+
+codex_effective_session_path() {
+  local dir
+  dir="$(codex_current_dir_marker)"
+  if [[ -n "$dir" ]]; then
+    print -r -- "$dir"
+    return 0
+  fi
+  tmux display-message -p -t "$CODEX_SESSION" '#{pane_current_path}' 2>/dev/null || true
 }
 
 codex_mark_history() {
@@ -3530,6 +3646,14 @@ codex_mark_runtime() {
   marker_file="$(codex_runtime_marker_file)"
   mkdir -p "${marker_file:h}"
   print -r -- "$mode" > "$marker_file"
+}
+
+codex_mark_dir() {
+  local dir="${1:-}"
+  local marker_file
+  marker_file="$(codex_session_dir_marker_file)"
+  mkdir -p "${marker_file:h}"
+  print -r -- "$dir" > "$marker_file"
 }
 
 codex_queue_resume_all() {
@@ -3862,7 +3986,7 @@ restart_codex_in_dir() {
   fi
 
   local -a codex_args
-  codex_args=("$CODEX_BIN")
+  codex_args=("$CODEX_BIN" "-C" "$dir")
   if [[ -n "$model" ]]; then
     codex_args+=("-m" "$model")
   fi
@@ -3870,9 +3994,10 @@ restart_codex_in_dir() {
     codex_args+=("-c" "model_reasoning_effort=\"$effort\"")
   fi
   codex_add_runtime_args_if_needed
-  tmux new-session -d -s "$CODEX_SESSION" -c "$dir" "${codex_args[@]}"
+  tmux new-session -d -s "$CODEX_SESSION" -c "$HOME" "${codex_args[@]}"
   codex_mark_history ""
   codex_mark_runtime "$(codex_runtime_mode_label)"
+  codex_mark_dir "$dir"
   if [[ -n "$model" && -n "$effort" ]]; then
     echo "$CODEX_SESSION restarted in $dir with $model $effort"
   elif [[ -n "$model" ]]; then
@@ -3922,7 +4047,7 @@ restart_codex_in_dir_with_prompt_file() {
   prompt_text="$(cat "$prompt_file")"
   tmux kill-session -t "$CODEX_SESSION" 2>/dev/null || true
   local -a codex_args
-  codex_args=("$CODEX_BIN")
+  codex_args=("$CODEX_BIN" "-C" "$dir")
   if [[ -n "$model" ]]; then
     codex_args+=("-m" "$model")
   fi
@@ -3931,9 +4056,10 @@ restart_codex_in_dir_with_prompt_file() {
   fi
   codex_add_runtime_args_if_needed
   codex_args+=("$prompt_text")
-  tmux new-session -d -s "$CODEX_SESSION" -c "$dir" "${codex_args[@]}"
+  tmux new-session -d -s "$CODEX_SESSION" -c "$HOME" "${codex_args[@]}"
   codex_mark_history ""
   codex_mark_runtime "$(codex_runtime_mode_label)"
+  codex_mark_dir "$dir"
   if ! wait_for_codex_input_ready "$CODEX_SESSION"; then
     echo "$CODEX_SESSION did not become ready after fresh initial prompt" >&2
     exit 70
@@ -4025,7 +4151,7 @@ ensure_codex_in_dir() {
   fi
 
   local -a codex_args
-  codex_args=("$CODEX_BIN")
+  codex_args=("$CODEX_BIN" "-C" "$dir")
   if [[ -n "$model" ]]; then
     codex_args+=("-m" "$model")
   fi
@@ -4035,12 +4161,13 @@ ensure_codex_in_dir() {
   codex_add_runtime_args_if_needed
 
   if ! tmux has-session -t "$CODEX_SESSION" 2>/dev/null; then
-    tmux new-session -d -s "$CODEX_SESSION" -c "$dir" "${codex_args[@]}"
+    tmux new-session -d -s "$CODEX_SESSION" -c "$HOME" "${codex_args[@]}"
     codex_mark_history ""
     codex_mark_runtime "$(codex_runtime_mode_label)"
+    codex_mark_dir "$dir"
     echo "$CODEX_SESSION started in $dir"
   else
-    current_path="$(tmux display-message -p -t "$CODEX_SESSION" '#{pane_current_path}' 2>/dev/null || true)"
+    current_path="$(codex_effective_session_path)"
     if [[ "$current_path" == "$dir" ]]; then
       if codex_runtime_requires_restart "$(codex_current_runtime_marker)"; then
         :
@@ -4055,9 +4182,10 @@ ensure_codex_in_dir() {
       exit 65
     fi
     tmux kill-session -t "$CODEX_SESSION"
-    tmux new-session -d -s "$CODEX_SESSION" -c "$dir" "${codex_args[@]}"
+    tmux new-session -d -s "$CODEX_SESSION" -c "$HOME" "${codex_args[@]}"
     codex_mark_history ""
     codex_mark_runtime "$(codex_runtime_mode_label)"
+    codex_mark_dir "$dir"
     echo "$CODEX_SESSION moved from ${current_path:-unknown} to $dir"
   fi
 }
@@ -4080,7 +4208,7 @@ ensure_codex_ready_for_send() {
     ensure_codex_in_dir "$model" "$effort" <<<"$dir"
     return
   fi
-  current_path="$(tmux display-message -p -t "$CODEX_SESSION" '#{pane_current_path}' 2>/dev/null || true)"
+  current_path="$(codex_effective_session_path)"
   if [[ "$current_path" == "$dir" ]]; then
     return 0
   fi
@@ -4095,7 +4223,7 @@ ensure_codex_for_prompt() {
   local model="${1:-}"
   local effort="${2:-}"
   local history_id="${3:-$CODEX_HISTORY_ID}"
-  local dir current_path pane_text marker_id runtime_mode latest_id force_new
+  local dir current_path pane_text marker_id runtime_mode latest_id force_new resume_status
   dir="$(read_path_arg)"
   force_new="${A_COCKPIT_CODEX_FORCE_NEW:-0}"
   [[ -n "$dir" ]] || dir="$(session_start_dir)"
@@ -4106,7 +4234,7 @@ ensure_codex_for_prompt() {
   need_tmux
 
   if tmux has-session -t "$CODEX_SESSION" 2>/dev/null; then
-    current_path="$(tmux display-message -p -t "$CODEX_SESSION" '#{pane_current_path}' 2>/dev/null || true)"
+    current_path="$(codex_effective_session_path)"
     pane_text="$(tmux capture-pane -pJ -t "$CODEX_SESSION" -S -30 2>/dev/null || true)"
     if codex_queue_pane_is_busy "$pane_text"; then
       if [[ -z "$history_id" && ( "$force_new" == "1" || "$force_new" == "true" || "$force_new" == "yes" ) ]]; then
@@ -4138,11 +4266,43 @@ ensure_codex_for_prompt() {
   fi
 
   if [[ -n "$history_id" ]]; then
-    resume_codex_session_in_dir "$history_id" "$model" "$effort" <<<"$dir"
-    return $?
+    if ( resume_codex_session_in_dir "$history_id" "$model" "$effort" <<<"$dir" ); then
+      return 0
+    else
+      resume_status=$?
+    fi
+    if [[ "${A_COCKPIT_CODEX_QUEUE_CONTEXT:-0}" == "1" && ( "$resume_status" == "65" || "$resume_status" == "70" ) ]]; then
+      echo "$CODEX_SESSION could not resume Codex history $history_id; starting a fresh runtime for queued prompt" >&2
+      codex_mark_history ""
+      tmux kill-session -t "$CODEX_SESSION" 2>/dev/null || true
+      if ensure_codex_in_dir "$model" "$effort" <<<"$dir"; then
+        :
+      else
+        resume_status=$?
+        return "$resume_status"
+      fi
+      if ! wait_for_codex_input_ready "$CODEX_SESSION" 160; then
+        echo "$CODEX_SESSION did not become ready after fresh fallback start" >&2
+        return 70
+      fi
+      return 0
+    fi
+    return "$resume_status"
   fi
 
-  ensure_codex_in_dir "$model" "$effort" <<<"$dir"
+  if ensure_codex_in_dir "$model" "$effort" <<<"$dir"; then
+    :
+  else
+    resume_status=$?
+    return "$resume_status"
+  fi
+  if [[ "${A_COCKPIT_CODEX_QUEUE_CONTEXT:-0}" == "1" ]]; then
+    if ! wait_for_codex_input_ready "$CODEX_SESSION" 160; then
+      echo "$CODEX_SESSION did not become ready after Codex start" >&2
+      return 70
+    fi
+  fi
+  return 0
 }
 
 codex_latest_session_id_for_dir() {
@@ -4708,7 +4868,7 @@ resume_codex_latest_in_dir() {
   fi
 
   if tmux has-session -t "$CODEX_SESSION" 2>/dev/null; then
-    current_path="$(tmux display-message -p -t "$CODEX_SESSION" '#{pane_current_path}' 2>/dev/null || true)"
+    current_path="$(codex_effective_session_path)"
     pane_text="$(tmux capture-pane -pJ -t "$CODEX_SESSION" -S -30 2>/dev/null || true)"
     if codex_queue_pane_is_busy "$pane_text"; then
       echo "$CODEX_SESSION is working in ${current_path:-unknown}. Finish or interrupt it before resuming the Codex.app conversation for $dir." >&2
@@ -4734,9 +4894,14 @@ resume_codex_latest_in_dir() {
     codex_args+=("-c" "model_reasoning_effort=\"$effort\"")
   fi
   codex_add_runtime_args_if_needed
-  tmux new-session -d -s "$CODEX_SESSION" -c "$dir" "${codex_args[@]}"
+  tmux new-session -d -s "$CODEX_SESSION" -c "$HOME" "${codex_args[@]}"
   codex_mark_history "$session_id"
   codex_mark_runtime "$(codex_runtime_mode_label)"
+  codex_mark_dir "$dir"
+  if ! wait_for_codex_input_ready "$CODEX_SESSION" 160; then
+    echo "$CODEX_SESSION did not become ready after resuming Codex history $session_id" >&2
+    exit 70
+  fi
   echo "$CODEX_SESSION resumed Codex history $session_id for $dir"
   echo "codex_history_id: $session_id"
 }
@@ -4780,7 +4945,7 @@ resume_codex_session_in_dir() {
     esac
   fi
   if tmux has-session -t "$CODEX_SESSION" 2>/dev/null; then
-    current_path="$(tmux display-message -p -t "$CODEX_SESSION" '#{pane_current_path}' 2>/dev/null || true)"
+    current_path="$(codex_effective_session_path)"
     pane_text="$(tmux capture-pane -pJ -t "$CODEX_SESSION" -S -30 2>/dev/null || true)"
     if codex_queue_pane_is_busy "$pane_text"; then
       echo "$CODEX_SESSION is working in ${current_path:-unknown}. Finish or interrupt it before switching to Codex history $session_id." >&2
@@ -4798,9 +4963,14 @@ resume_codex_session_in_dir() {
     codex_args+=("-c" "model_reasoning_effort=\"$effort\"")
   fi
   codex_add_runtime_args_if_needed
-  tmux new-session -d -s "$CODEX_SESSION" -c "$dir" "${codex_args[@]}"
+  tmux new-session -d -s "$CODEX_SESSION" -c "$HOME" "${codex_args[@]}"
   codex_mark_history "$session_id"
   codex_mark_runtime "$(codex_runtime_mode_label)"
+  codex_mark_dir "$dir"
+  if ! wait_for_codex_input_ready "$CODEX_SESSION" 160; then
+    echo "$CODEX_SESSION did not become ready after resuming Codex history $session_id" >&2
+    exit 70
+  fi
   echo "$CODEX_SESSION resumed Codex history $session_id for $dir"
   echo "codex_history_id: $session_id"
 }
@@ -4876,6 +5046,8 @@ sqlite_titles = {}
 sqlite_paths = {}
 sqlite_meta = {}
 sqlite_records = []
+spawn_child_ids = set()
+spawn_parent_ids = set()
 state_db = pathlib.Path.home() / ".codex" / "state_5.sqlite"
 index_path = pathlib.Path.home() / ".codex" / "session_index.jsonl"
 index_titles = {}
@@ -5225,6 +5397,14 @@ if state_db.exists():
     try:
         with sqlite3.connect(str(state_db)) as conn:
             repair_thread_visibility(conn)
+            try:
+                for parent_id, child_id in conn.execute("select parent_thread_id, child_thread_id from thread_spawn_edges"):
+                    if parent_id:
+                        spawn_parent_ids.add(str(parent_id))
+                    if child_id:
+                        spawn_child_ids.add(str(child_id))
+            except Exception:
+                pass
             for session_id, cwd, title, rollout_path, source, thread_source, agent_role, preview, first_user_message in conn.execute(
                 "select id, cwd, title, rollout_path, source, coalesce(thread_source,''), coalesce(agent_role,''), coalesce(preview,''), coalesce(first_user_message,'') from threads"
             ):
@@ -5238,6 +5418,8 @@ if state_db.exists():
                     "source": source,
                     "thread_source": thread_source,
                     "agent_role": agent_role,
+                    "spawn_child": session_id in spawn_child_ids,
+                    "spawn_parent": session_id in spawn_parent_ids,
                 }
                 if rollout_path:
                     expanded_rollout_path = str(pathlib.Path(rollout_path).expanduser())
@@ -5287,6 +5469,8 @@ if state_db.exists():
                     "title": clean_title or "Codex session",
                     "source": source,
                     "thread_source": thread_source,
+                    "spawn_child": session_id in spawn_child_ids,
+                    "spawn_parent": session_id in spawn_parent_ids,
                     "host": host,
                 })
     except Exception:
@@ -5387,6 +5571,8 @@ for _, path, stat in scan_paths:
         "title": selected_title,
         "source": str(meta_source.get("source") or "cli"),
         "thread_source": str(meta_source.get("thread_source") or meta_thread_source or "user"),
+        "spawn_child": bool(meta_source.get("spawn_child") or session_id in spawn_child_ids or sqlite_session_id in spawn_child_ids),
+        "spawn_parent": bool(meta_source.get("spawn_parent") or session_id in spawn_parent_ids or sqlite_session_id in spawn_parent_ids),
         "host": host,
     })
 
@@ -5445,6 +5631,8 @@ def better_record(first, second):
     if not str(merged.get("cwd") or "").strip():
         merged["cwd"] = str(other.get("cwd") or "")
     merged["mtime"] = max(int(first.get("mtime") or 0), int(second.get("mtime") or 0))
+    merged["spawn_child"] = bool(first.get("spawn_child") or second.get("spawn_child"))
+    merged["spawn_parent"] = bool(first.get("spawn_parent") or second.get("spawn_parent"))
     return merged
 
 deduped = {}

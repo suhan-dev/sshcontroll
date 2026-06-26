@@ -1609,19 +1609,6 @@ private struct CodexQueueChip: View {
             model.promoteCodexQueueItemToSteer(item.id)
           }
         }
-        if item.kind == .steer && (item.status == .queued || item.status == .waitingForCodex) {
-          queueTextButton(
-            "Send",
-            symbol: "paperplane",
-            tint: .blue,
-            isDisabled: false,
-            help: item.status == .waitingForCodex
-              ? "Cancel this A queued steer and resend it as a normal prompt if it has not started yet"
-              : "Send this queued item as a normal prompt"
-          ) {
-            model.demoteCodexQueueItemToSend(item.id)
-          }
-        }
         if item.status == .failed {
           queueIconButton("arrow.clockwise", help: "Retry this prompt") {
             model.retryCodexQueueItem(item.id)
@@ -2636,7 +2623,7 @@ struct CodexTranscriptCard: View {
     guard !clean.isEmpty else { return nil }
     let lower = clean.lowercased()
     guard lower.contains("reset") || lower.contains("resets") else { return nil }
-    return clean
+    return CodexTokenResetNormalizer.normalizeSummary(clean)
   }
 
   var body: some View {

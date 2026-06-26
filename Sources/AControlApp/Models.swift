@@ -826,6 +826,8 @@ struct CodexHistoryRecord: Identifiable, Codable, Hashable {
   var title: String
   var source: String? = nil
   var threadSource: String? = nil
+  var spawnChild: Bool? = nil
+  var spawnParent: Bool? = nil
   var host: String? = nil
 
   var shortID: String {
@@ -845,6 +847,10 @@ struct CodexHistoryRecord: Identifiable, Codable, Hashable {
     return values.contains("subagent") || values.contains { $0.contains("\"subagent\"") }
   }
 
+  var isSpawnChild: Bool {
+    spawnChild == true
+  }
+
   enum CodingKeys: String, CodingKey {
     case id
     case cwd
@@ -853,6 +859,8 @@ struct CodexHistoryRecord: Identifiable, Codable, Hashable {
     case title
     case source
     case threadSource = "thread_source"
+    case spawnChild = "spawn_child"
+    case spawnParent = "spawn_parent"
     case host
   }
 }
@@ -1156,6 +1164,63 @@ extension String {
 
   var nilIfEmpty: String? {
     trimmed.isEmpty ? nil : self
+  }
+}
+
+enum CodexTokenResetNormalizer {
+  static func normalizeSummary(_ summary: String) -> String {
+    let base = summary
+      .replacingOccurrences(of: "5hr resets", with: "5h resets")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !base.isEmpty,
+      let regex = try? NSRegularExpression(
+        pattern:
+          #"(5h resets|Weekly resets)\s+([0-9]{1,2}:[0-9]{2}\s+on\s+[0-9]{1,2}\s+[A-Za-z]{3})"#,
+        options: []
+      )
+    else { return base }
+
+    var output = base
+    let matches = regex.matches(in: base, range: NSRange(base.startIndex..., in: base))
+    for match in matches.reversed() {
+      guard match.numberOfRanges >= 3,
+        let fullRange = Range(match.range(at: 0), in: output),
+        let labelRange = Range(match.range(at: 1), in: output),
+        let timeRange = Range(match.range(at: 2), in: output)
+      else { continue }
+      let label = String(output[labelRange])
+      let rawTime = String(output[timeRange])
+      let interval: TimeInterval = label.localizedCaseInsensitiveContains("weekly")
+        ? 7 * 24 * 60 * 60
+        : 5 * 60 * 60
+      output.replaceSubrange(
+        fullRange,
+        with: "\(label) \(normalizeResetTime(rawTime, recurrence: interval))"
+      )
+    }
+    return output
+  }
+
+  private static func normalizeResetTime(_ raw: String, recurrence: TimeInterval) -> String {
+    let clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    let calendar = Calendar.current
+    let year = calendar.component(.year, from: Date())
+    let parser = DateFormatter()
+    parser.locale = Locale(identifier: "en_US_POSIX")
+    parser.dateFormat = "HH:mm 'on' d MMM yyyy"
+    guard var date = parser.date(from: "\(clean) \(year)") else { return clean }
+
+    let now = Date()
+    var guardCount = 0
+    while date < now.addingTimeInterval(-60), guardCount < 200 {
+      date = date.addingTimeInterval(recurrence)
+      guardCount += 1
+    }
+
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.dateFormat = "HH:mm 'on' d MMM"
+    return formatter.string(from: date)
   }
 }
 
