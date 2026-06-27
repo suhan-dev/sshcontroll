@@ -163,6 +163,7 @@ final class AppModel: ObservableObject {
   private var codexTranscriptAutoRefreshDeadline: Date?
   private var lastCodexHistoryRefresh: Date?
   private var lastCodexHistoryRefreshDirectory = ""
+  private var codexHistoryTranscriptLoadedAtByID: [String: Date] = [:]
   private var codexTranscriptFingerprint = ""
   private var claudeTranscriptFingerprint = ""
   private var codexAnalysisTask: Task<Void, Never>?
@@ -3104,8 +3105,7 @@ final class AppModel: ObservableObject {
     let result = await codexHistoryTranscriptBackgroundResult(for: record, tailBytes: tailBytes)
     guard result.exitCode == 0, !result.output.trimmed.isEmpty else { return }
     if activeSessionID == session.id {
-      updateCodexTranscriptWindowState(from: result.output, record: record, tailBytes: tailBytes)
-      applyCodexTranscriptResult(result)
+      _ = applyCodexHistoryTranscriptResult(result, record: record, tailBytes: tailBytes)
     } else {
       persistBackgroundTranscript(.codex, value: result.output, sessionID: session.id)
     }
@@ -3433,6 +3433,17 @@ final class AppModel: ObservableObject {
       clearCodexDerivedState()
       return
     }
+    if let record = activeCodexHistoryRecord(),
+      shouldReplaceWithCodexHistoryTranscript(record)
+    {
+      let historyResult = await codexHistoryTranscriptResult(
+        for: record,
+        tailBytes: codexTranscriptTailBytesByHistoryID[record.id.trimmed]
+      )
+      if applyCodexHistoryTranscriptResult(historyResult, record: record, force: true) {
+        return
+      }
+    }
     if session.codexState == .running {
       let result = await runRemote("capture-codex", timeout: 30, showsActivity: false)
       if result.exitCode == 0, !result.combined.trimmed.isEmpty {
@@ -3442,9 +3453,7 @@ final class AppModel: ObservableObject {
     }
     if let record = activeCodexHistoryRecord() {
       let historyResult = await codexHistoryTranscriptResult(for: record)
-      if historyResult.exitCode == 0, !historyResult.output.trimmed.isEmpty {
-        updateCodexTranscriptWindowState(from: historyResult.output, record: record)
-        applyCodexTranscriptResult(historyResult)
+      if applyCodexHistoryTranscriptResult(historyResult, record: record) {
         return
       }
     }
@@ -4252,6 +4261,9 @@ final class AppModel: ObservableObject {
       codexModel = "gpt-5.5"
     }
     ensureConversationSession(defaultTool: .codex)
+    if steer {
+      await refreshCodexWorkingStates(force: true)
+    }
     let shouldSteer = steer
     if shouldSteer, !activeCodexCanSteer {
       statusText = "Send first, then steer the running or A-queued task · \(Date().shortStamp)"
@@ -4713,14 +4725,12 @@ final class AppModel: ObservableObject {
   }
 
   private func loadCodexHistoryTranscript(_ record: CodexHistoryRecord) async {
-    let result = await codexHistoryTranscriptResult(for: record)
-    guard result.exitCode == 0, !result.output.trimmed.isEmpty else { return }
-    updateCodexTranscriptWindowState(from: result.output, record: record)
-    let mergedInput = codexTranscriptPreservingLocalTurns(result.output)
-    let merged = persistTranscript(.codex, value: mergedInput)
-    updateActiveCodexWorkingState(from: result.output, mayStart: true)
-    guard setCodexTranscript(merged) else { return }
-    scheduleCodexTranscriptAnalysis()
+    let historyID = record.id.trimmed
+    let result = await codexHistoryTranscriptResult(
+      for: record,
+      tailBytes: codexTranscriptTailBytesByHistoryID[historyID]
+    )
+    _ = applyCodexHistoryTranscriptResult(result, record: record, force: true)
   }
 
   func loadMoreCodexTranscript() async {
@@ -4740,14 +4750,37 @@ final class AppModel: ObservableObject {
       return
     }
     codexTranscriptTailBytesByHistoryID[historyID] = nextBytes
-    updateCodexTranscriptWindowState(from: result.output, record: record, tailBytes: nextBytes)
+    _ = applyCodexHistoryTranscriptResult(
+      result,
+      record: record,
+      tailBytes: nextBytes,
+      force: true
+    )
+    statusText = "Older transcript loaded · \(Date().shortStamp)"
+  }
+
+  @discardableResult
+  private func applyCodexHistoryTranscriptResult(
+    _ result: CommandResult,
+    record: CodexHistoryRecord,
+    tailBytes: Int? = nil,
+    force: Bool = false
+  ) -> Bool {
+    codexTranscriptCheckedAt = Date()
+    guard result.exitCode == 0, !result.output.trimmed.isEmpty else { return false }
+    updateCodexTranscriptWindowState(from: result.output, record: record, tailBytes: tailBytes)
     let mergedInput = codexTranscriptPreservingLocalTurns(result.output)
     let merged = persistTranscript(.codex, value: mergedInput)
     updateActiveCodexWorkingState(from: result.output, mayStart: true)
-    if setCodexTranscript(merged, force: true) {
+    let historyID = record.id.trimmed
+    if !historyID.isEmpty {
+      codexHistoryTranscriptLoadedAtByID[historyID] = Date()
+    }
+    let changed = setCodexTranscript(merged, force: force)
+    if changed {
       scheduleCodexTranscriptAnalysis()
     }
-    statusText = "Older transcript loaded · \(Date().shortStamp)"
+    return changed
   }
 
   private func codexHistoryTranscriptResult(
@@ -4826,15 +4859,25 @@ final class AppModel: ObservableObject {
 
   private func shouldReplaceWithCodexHistoryTranscript(_ record: CodexHistoryRecord) -> Bool {
     let transcript = codexTranscript.trimmed
-    guard !record.id.trimmed.isEmpty else { return false }
+    let historyID = record.id.trimmed
+    guard !historyID.isEmpty else { return false }
     guard !transcript.isEmpty else { return true }
     if transcript.contains("resumed Codex history") {
       return true
     }
-    if transcript.contains("codex_history_id: \(record.id)") {
-      return false
+    if !transcript.contains("codex_history_id: \(historyID)") {
+      return true
     }
-    return false
+    if transcript.lengthOfBytes(using: .utf8) < 32 * 1024 {
+      return true
+    }
+    guard record.mtime > 0 else {
+      return codexHistoryTranscriptLoadedAtByID[historyID] == nil
+    }
+    guard let loadedAt = codexHistoryTranscriptLoadedAtByID[historyID] else {
+      return true
+    }
+    return TimeInterval(record.mtime) > loadedAt.timeIntervalSince1970 + 1
   }
 
   private func activeCodexHistoryRecord() -> CodexHistoryRecord? {
@@ -8085,6 +8128,16 @@ final class AppModel: ObservableObject {
     sessions[index].nameSource = .user
     sessions[index].updatedAt = Date()
     saveSessions()
+  }
+
+  func setSessionPinned(_ session: SessionCard, pinned: Bool) {
+    guard let index = sessions.firstIndex(where: { $0.id == session.id }) else { return }
+    guard sessions[index].isPinned != pinned else { return }
+    sessions[index].isPinned = pinned
+    saveSessions()
+    statusText = pinned
+      ? "Session pinned · \(Date().shortStamp)"
+      : "Session unpinned · \(Date().shortStamp)"
   }
 
   func deleteSession(_ session: SessionCard) async {

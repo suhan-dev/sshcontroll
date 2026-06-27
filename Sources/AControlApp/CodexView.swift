@@ -2556,6 +2556,7 @@ struct CodexTranscriptCard: View {
   @State private var wheelScrollButtonFallback = false
   @State private var scrollButtonSuppressed = false
   @State private var suppressAwayReportsUntil = Date.distantPast
+  @State private var forceFollowTailUntil = Date.distantPast
   @State private var recentUserScrollUntil = Date.distantPast
   @State private var transcriptScheme: ColorScheme?
   @State private var transcriptDistanceToBottom: CGFloat = 0
@@ -2755,7 +2756,12 @@ struct CodexTranscriptCard: View {
       }
       .onChange(of: text) { _, _ in
         guard !isLoadingMoreTranscript else { return }
-        guard !userHasScrolledAway else { return }
+        let shouldFollowTail =
+          Date() < forceFollowTailUntil || (transcriptAtBottom && !userHasScrolledAway)
+        guard shouldFollowTail else {
+          scrollButtonSuppressed = false
+          return
+        }
         suppressAwayReportsUntil = Date().addingTimeInterval(0.65)
         userHasScrolledAway = false
         wheelScrollButtonFallback = false
@@ -2763,12 +2769,11 @@ struct CodexTranscriptCard: View {
         transcriptDistanceToBottom = 0
         DispatchQueue.main.async {
           followTailSignal += 1
-          scrollSignal += 1
           DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-            scrollSignal += 1
+            followTailSignal += 1
           }
           DispatchQueue.main.asyncAfter(deadline: .now() + 0.34) {
-            scrollSignal += 1
+            followTailSignal += 1
           }
         }
       }
@@ -2794,6 +2799,7 @@ struct CodexTranscriptCard: View {
       }
       .onChange(of: sessionID) { _, _ in
         suppressAwayReportsUntil = Date().addingTimeInterval(1.2)
+        forceFollowTailUntil = Date().addingTimeInterval(2.0)
         scrollButtonSuppressed = true
         recentUserScrollUntil = .distantPast
         transcriptAtBottom = true
@@ -2819,12 +2825,20 @@ struct CodexTranscriptCard: View {
             wheelScrollButtonFallback = false
             scrollSignal += 1
           }
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.90) {
+            transcriptAtBottom = true
+            transcriptDistanceToBottom = 0
+            userHasScrolledAway = false
+            wheelScrollButtonFallback = false
+            scrollSignal += 1
+          }
           DispatchQueue.main.asyncAfter(deadline: .now() + 1.25) {
             scrollButtonSuppressed = false
             if transcriptAtBottom {
               userHasScrolledAway = false
               wheelScrollButtonFallback = false
             }
+            forceFollowTailUntil = .distantPast
           }
         }
       }

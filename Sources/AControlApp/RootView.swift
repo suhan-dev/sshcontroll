@@ -166,14 +166,8 @@ struct RootView: View {
       search.isEmpty
       ? model.sessions
       : model.sessions.filter { sidebarSession($0, matches: search) }
-    let selectedGroupID = model.sessions
-      .first(where: { $0.id == model.activeSessionID })
-      .map { sidebarProjectID(for: $0.remoteDir) }
-    let grouped = Dictionary(grouping: searchableSessions) { session in
-      sidebarProjectID(for: session.remoteDir)
-    }
-    let groups = grouped.map { id, sessions in
-      let sortedSessions = sessions.sorted { first, second in
+    let sortSessions: ([SessionCard]) -> [SessionCard] = { sessions in
+      sessions.sorted { first, second in
         if first.id == model.activeSessionID { return true }
         if second.id == model.activeSessionID { return false }
         let firstWorking =
@@ -185,6 +179,15 @@ struct RootView: View {
         if firstWorking != secondWorking { return firstWorking }
         return first.updatedAt > second.updatedAt
       }
+    }
+    let selectedGroupID = model.sessions
+      .first(where: { $0.id == model.activeSessionID })
+      .map { sidebarProjectID(for: $0.remoteDir) }
+    let grouped = Dictionary(grouping: searchableSessions) { session in
+      sidebarProjectID(for: session.remoteDir)
+    }
+    let groups = grouped.map { id, sessions in
+      let sortedSessions = sortSessions(sessions)
       let rawPath = sessions.first?.remoteDir.trimmed ?? ""
       let hasWorking = sessions.contains {
         model.codexWorkingSessionIDs.contains($0.id)
@@ -196,15 +199,37 @@ struct RootView: View {
         detail: sidebarProjectDetail(for: rawPath),
         sessions: sortedSessions,
         hasWorking: hasWorking,
-        updatedAt: sortedSessions.map(\.updatedAt).max() ?? .distantPast
+        updatedAt: sortedSessions.map(\.updatedAt).max() ?? .distantPast,
+        symbol: "folder"
       )
     }
-    return groups.sorted { first, second in
+    var sortedGroups = groups.sorted { first, second in
       if first.id == selectedGroupID { return true }
       if second.id == selectedGroupID { return false }
       if first.hasWorking != second.hasWorking { return first.hasWorking }
       return first.updatedAt > second.updatedAt
     }
+    let pinnedSessions = sortSessions(searchableSessions.filter(\.isPinned))
+    if !pinnedSessions.isEmpty {
+      let hasWorking = pinnedSessions.contains {
+        model.codexWorkingSessionIDs.contains($0.id)
+          || model.claudeWorkingSessionIDs.contains($0.id)
+      }
+      sortedGroups.insert(
+        SidebarProjectGroup(
+          id: "__sshcontroll_pinned__",
+          title: "Pinned",
+          detail: "Pinned sessions",
+          sessions: pinnedSessions,
+          hasWorking: hasWorking,
+          updatedAt: pinnedSessions.map(\.updatedAt).max() ?? .distantPast,
+          symbol: "pin.fill",
+          isPinnedGroup: true
+        ),
+        at: 0
+      )
+    }
+    return sortedGroups
   }
 
   private var filteredSidebarSessionCount: Int {
@@ -229,7 +254,7 @@ struct RootView: View {
 
   private func sidebarProjectSection(_ group: SidebarProjectGroup) -> some View {
     let isSearching = !sidebarSearchText.trimmed.isEmpty
-    let isExpanded = isSearching || expandedSidebarProjectIDs.contains(group.id)
+    let isExpanded = group.isPinnedGroup || isSearching || expandedSidebarProjectIDs.contains(group.id)
     let visibleLimit =
       isSearching
       ? group.sessions.count
@@ -246,8 +271,11 @@ struct RootView: View {
         isWorking: group.hasWorking,
         isSelected: group.sessions.contains { $0.id == model.activeSessionID },
         isExpanded: isExpanded,
-        sessionCount: group.sessions.count
+        sessionCount: group.sessions.count,
+        symbol: group.symbol,
+        hidesChevron: group.isPinnedGroup
       ) {
+        guard !group.isPinnedGroup else { return }
         toggleSidebarProjectExpansion(group.id)
       }
 
@@ -264,6 +292,9 @@ struct RootView: View {
           Task { await model.openSession(session) }
         }
         .contextMenu {
+          Button(session.isPinned ? "Unpin" : "Pin") {
+            model.setSessionPinned(session, pinned: !session.isPinned)
+          }
           Button("Rename") {
             renameText = session.displayTitle
             renamingSession = session
@@ -420,6 +451,8 @@ private struct SidebarProjectGroup: Identifiable {
   var sessions: [SessionCard]
   var hasWorking: Bool
   var updatedAt: Date
+  var symbol: String = "folder"
+  var isPinnedGroup: Bool = false
 }
 
 private struct SidebarProjectHeaderRow: View {
@@ -430,12 +463,14 @@ private struct SidebarProjectHeaderRow: View {
   var isSelected: Bool
   var isExpanded: Bool
   var sessionCount: Int
+  var symbol: String = "folder"
+  var hidesChevron = false
   var action: () -> Void
 
   var body: some View {
     Button(action: action) {
       HStack(spacing: 9) {
-        Image(systemName: "folder")
+        Image(systemName: symbol)
           .font(.system(size: 15, weight: .semibold))
           .frame(width: 20)
           .foregroundStyle(.secondary)
@@ -469,10 +504,12 @@ private struct SidebarProjectHeaderRow: View {
             .frame(height: 18)
             .background(Color.primary.opacity(colorScheme == .dark ? 0.10 : 0.055), in: Capsule())
         }
-        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-          .font(.system(size: 10, weight: .bold))
-          .foregroundStyle(.secondary.opacity(0.76))
-          .frame(width: 12)
+        if !hidesChevron {
+          Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+            .font(.system(size: 10, weight: .bold))
+            .foregroundStyle(.secondary.opacity(0.76))
+            .frame(width: 12)
+        }
       }
       .padding(.horizontal, 8)
       .padding(.vertical, 6)
@@ -716,6 +753,12 @@ private struct SidebarSessionRow: View {
           Text(compact(session.displayTitle, limit: showsPath ? 56 : 58))
             .font(.callout.weight(isSelected ? .semibold : .medium))
             .lineLimit(1)
+          if session.isPinned {
+            Image(systemName: "pin.fill")
+              .font(.system(size: 10, weight: .semibold))
+              .foregroundStyle(.secondary.opacity(0.72))
+              .safeHelp("Pinned")
+          }
           Spacer(minLength: 0)
           if !showsPath, !isWorking {
             Text(relativeAge)

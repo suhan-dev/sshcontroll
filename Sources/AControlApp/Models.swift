@@ -982,6 +982,7 @@ struct SessionCard: Identifiable, Codable, Hashable {
   var codexHistoryHost: String
   var codexState: CodexSessionState
   var nameSource: SessionNameSource
+  var isPinned: Bool
   var note: String
   var updatedAt: Date
 
@@ -999,6 +1000,7 @@ struct SessionCard: Identifiable, Codable, Hashable {
     self.codexHistoryHost = "remote"
     self.codexState = .fresh
     self.nameSource = name.trimmed.isEmpty ? .generated : .user
+    self.isPinned = false
     self.note = ""
     self.updatedAt = Date()
   }
@@ -1093,6 +1095,7 @@ struct SessionCard: Identifiable, Codable, Hashable {
     case codexHistoryHost
     case codexState
     case nameSource
+    case isPinned
     case note
     case updatedAt
   }
@@ -1122,6 +1125,7 @@ struct SessionCard: Identifiable, Codable, Hashable {
       try container.decodeIfPresent(CodexSessionState.self, forKey: .codexState)
       ?? (codexHistoryID.trimmed.isEmpty ? .fresh : .linked)
     nameSource = try container.decodeIfPresent(SessionNameSource.self, forKey: .nameSource) ?? .user
+    isPinned = try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
     note = try container.decodeIfPresent(String.self, forKey: .note) ?? ""
     updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
   }
