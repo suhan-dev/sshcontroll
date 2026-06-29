@@ -168,8 +168,6 @@ struct RootView: View {
       : model.sessions.filter { sidebarSession($0, matches: search) }
     let sortSessions: ([SessionCard]) -> [SessionCard] = { sessions in
       sessions.sorted { first, second in
-        if first.id == model.activeSessionID { return true }
-        if second.id == model.activeSessionID { return false }
         let firstWorking =
           model.codexWorkingSessionIDs.contains(first.id)
           || model.claudeWorkingSessionIDs.contains(first.id)
@@ -180,9 +178,6 @@ struct RootView: View {
         return first.updatedAt > second.updatedAt
       }
     }
-    let selectedGroupID = model.sessions
-      .first(where: { $0.id == model.activeSessionID })
-      .map { sidebarProjectID(for: $0.remoteDir) }
     let grouped = Dictionary(grouping: searchableSessions) { session in
       sidebarProjectID(for: session.remoteDir)
     }
@@ -204,8 +199,6 @@ struct RootView: View {
       )
     }
     var sortedGroups = groups.sorted { first, second in
-      if first.id == selectedGroupID { return true }
-      if second.id == selectedGroupID { return false }
       if first.hasWorking != second.hasWorking { return first.hasWorking }
       return first.updatedAt > second.updatedAt
     }
