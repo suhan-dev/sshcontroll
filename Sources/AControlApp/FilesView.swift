@@ -32,6 +32,18 @@ struct FilesView: View {
     }
   }
 
+  private var visibleFileTransfers: [FileTransferProgress] {
+    model.activeFileTransfers.sorted { first, second in
+      if first.isFinished != second.isFinished {
+        return !first.isFinished
+      }
+      if (first.succeeded == false) != (second.succeeded == false) {
+        return first.succeeded == false
+      }
+      return first.updatedAt > second.updatedAt
+    }
+  }
+
   var body: some View {
     ZStack(alignment: .bottom) {
       VStack(alignment: .leading, spacing: 14) {
@@ -88,7 +100,7 @@ struct FilesView: View {
         }
         .layoutPriority(1)
 
-        if !model.lastMirrorLog.isEmpty && model.activeFileTransfer == nil {
+        if !model.lastMirrorLog.isEmpty && model.activeFileTransfers.isEmpty {
           GlassPanel(title: "Last File Operation", symbol: "text.alignleft", accent: .orange) {
             TranscriptView(
               text: model.lastMirrorLog,
@@ -100,12 +112,19 @@ struct FilesView: View {
       }
       .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
-      if let progress = model.activeFileTransfer {
-        FileTransferFloatingStatus(progress: progress)
-          .padding(.horizontal, 18)
-          .padding(.bottom, 12)
-          .transition(.move(edge: .bottom).combined(with: .opacity))
-          .zIndex(20)
+      if !model.activeFileTransfers.isEmpty {
+        ScrollView(.vertical, showsIndicators: true) {
+          VStack(spacing: 8) {
+            ForEach(visibleFileTransfers) { progress in
+              FileTransferFloatingStatus(progress: progress)
+            }
+          }
+        }
+        .frame(maxHeight: 360)
+        .padding(.horizontal, 18)
+        .padding(.bottom, 12)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+        .zIndex(20)
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -522,6 +541,15 @@ private struct FileTransferFloatingStatus: View {
               .font(.system(size: 11, weight: .bold, design: .monospaced))
               .foregroundStyle(.secondary)
               .frame(width: 44, alignment: .trailing)
+          } else if progress.isFinished {
+            Image(systemName: progress.succeeded == true ? "checkmark.circle.fill" : "xmark.circle.fill")
+              .font(.system(size: 13, weight: .semibold))
+              .foregroundStyle(progress.succeeded == true ? .green : .red)
+            Text(progress.destination)
+              .font(.caption)
+              .foregroundStyle(.secondary)
+              .lineLimit(1)
+              .truncationMode(.middle)
           } else {
             ProgressView()
               .controlSize(.small)

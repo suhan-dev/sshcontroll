@@ -166,16 +166,11 @@ struct RootView: View {
       search.isEmpty
       ? model.sessions
       : model.sessions.filter { sidebarSession($0, matches: search) }
-    let selectedGroupID = model.sessions
-      .first(where: { $0.id == model.activeSessionID })
-      .map { sidebarProjectID(for: $0.remoteDir) }
-    let grouped = Dictionary(grouping: searchableSessions) { session in
-      sidebarProjectID(for: session.remoteDir)
-    }
-    let groups = grouped.map { id, sessions in
-      let sortedSessions = sessions.sorted { first, second in
-        if first.id == model.activeSessionID { return true }
-        if second.id == model.activeSessionID { return false }
+    let projectSessions = searchableSessions.filter { !$0.isPinned }
+    let modelOrderIndex = Dictionary(
+      uniqueKeysWithValues: model.sessions.enumerated().map { ($0.element.id, $0.offset) })
+    let sortSessions: ([SessionCard]) -> [SessionCard] = { sessions in
+      sessions.sorted { first, second in
         let firstWorking =
           model.codexWorkingSessionIDs.contains(first.id)
           || model.claudeWorkingSessionIDs.contains(first.id)
@@ -183,8 +178,17 @@ struct RootView: View {
           model.codexWorkingSessionIDs.contains(second.id)
           || model.claudeWorkingSessionIDs.contains(second.id)
         if firstWorking != secondWorking { return firstWorking }
+        if firstWorking && secondWorking {
+          return (modelOrderIndex[first.id] ?? Int.max) < (modelOrderIndex[second.id] ?? Int.max)
+        }
         return first.updatedAt > second.updatedAt
       }
+    }
+    let grouped = Dictionary(grouping: projectSessions) { session in
+      sidebarProjectID(for: session.remoteDir)
+    }
+    let groups = grouped.map { id, sessions in
+      let sortedSessions = sortSessions(sessions)
       let rawPath = sessions.first?.remoteDir.trimmed ?? ""
       let hasWorking = sessions.contains {
         model.codexWorkingSessionIDs.contains($0.id)
@@ -196,15 +200,35 @@ struct RootView: View {
         detail: sidebarProjectDetail(for: rawPath),
         sessions: sortedSessions,
         hasWorking: hasWorking,
-        updatedAt: sortedSessions.map(\.updatedAt).max() ?? .distantPast
+        updatedAt: sortedSessions.map(\.updatedAt).max() ?? .distantPast,
+        symbol: "folder"
       )
     }
-    return groups.sorted { first, second in
-      if first.id == selectedGroupID { return true }
-      if second.id == selectedGroupID { return false }
+    var sortedGroups = groups.sorted { first, second in
       if first.hasWorking != second.hasWorking { return first.hasWorking }
       return first.updatedAt > second.updatedAt
     }
+    let pinnedSessions = sortSessions(searchableSessions.filter(\.isPinned))
+    if !pinnedSessions.isEmpty {
+      let hasWorking = pinnedSessions.contains {
+        model.codexWorkingSessionIDs.contains($0.id)
+          || model.claudeWorkingSessionIDs.contains($0.id)
+      }
+      sortedGroups.insert(
+        SidebarProjectGroup(
+          id: "__sshcontroll_pinned__",
+          title: "Pinned",
+          detail: "Pinned sessions",
+          sessions: pinnedSessions,
+          hasWorking: hasWorking,
+          updatedAt: pinnedSessions.map(\.updatedAt).max() ?? .distantPast,
+          symbol: "pin.fill",
+          isPinnedGroup: true
+        ),
+        at: 0
+      )
+    }
+    return sortedGroups
   }
 
   private var filteredSidebarSessionCount: Int {
@@ -229,16 +253,28 @@ struct RootView: View {
 
   private func sidebarProjectSection(_ group: SidebarProjectGroup) -> some View {
     let isSearching = !sidebarSearchText.trimmed.isEmpty
-    let isExpanded = isSearching || expandedSidebarProjectIDs.contains(group.id)
+    let activeID = model.activeSessionID
+    let containsActiveSession = group.sessions.contains { $0.id == activeID }
+    let isExpanded =
+      group.isPinnedGroup || isSearching || containsActiveSession
+      || expandedSidebarProjectIDs.contains(group.id)
     let visibleLimit =
       isSearching
       ? group.sessions.count
       : min(group.sessions.count, sidebarProjectVisibleLimits[group.id] ?? sidebarProjectSessionPageSize)
-    let visibleSessions =
-      isExpanded
-      ? Array(group.sessions.prefix(visibleLimit))
-      : []
-    let remainingSessionCount = max(0, group.sessions.count - visibleLimit)
+    let visibleSessions: [SessionCard] = {
+      guard isExpanded else { return [] }
+      var sessions = Array(group.sessions.prefix(visibleLimit))
+      if let activeID, let active = group.sessions.first(where: { $0.id == activeID }),
+        !sessions.contains(where: { $0.id == activeID })
+      {
+        sessions.append(active)
+      }
+      return sessions
+    }()
+    let visibleSessionIDs = Set(visibleSessions.map(\.id))
+    let remainingSessionCount =
+      group.sessions.filter { !visibleSessionIDs.contains($0.id) }.count
     return VStack(alignment: .leading, spacing: 4) {
       SidebarProjectHeaderRow(
         title: group.title,
@@ -246,8 +282,11 @@ struct RootView: View {
         isWorking: group.hasWorking,
         isSelected: group.sessions.contains { $0.id == model.activeSessionID },
         isExpanded: isExpanded,
-        sessionCount: group.sessions.count
+        sessionCount: group.sessions.count,
+        symbol: group.symbol,
+        hidesChevron: group.isPinnedGroup
       ) {
+        guard !group.isPinnedGroup else { return }
         toggleSidebarProjectExpansion(group.id)
       }
 
@@ -264,6 +303,9 @@ struct RootView: View {
           Task { await model.openSession(session) }
         }
         .contextMenu {
+          Button(session.isPinned ? "Unpin" : "Pin") {
+            model.setSessionPinned(session, pinned: !session.isPinned)
+          }
           Button("Rename") {
             renameText = session.displayTitle
             renamingSession = session
@@ -318,21 +360,41 @@ struct RootView: View {
   }
 
   private func normalizedSidebarProjectPath(_ rawPath: String) -> String {
+    let remoteHome = normalizedSidebarPathComponent(model.settings.remoteHome)
     var value = rawPath.trimmed
     guard !value.isEmpty else { return "" }
+    if value == "~" {
+      value = remoteHome.isEmpty ? value : remoteHome
+    } else if value.hasPrefix("~/"), !remoteHome.isEmpty {
+      value = remoteHome + "/" + String(value.dropFirst(2))
+    }
+    value = normalizedSidebarPathComponent(value)
+    if value == "." || value == "~" || value == remoteHome {
+      return remoteHome.isEmpty ? value : remoteHome
+    }
+    return value
+  }
+
+  private func normalizedSidebarPathComponent(_ rawPath: String) -> String {
+    var value = rawPath.trimmed.decomposedStringWithCanonicalMapping
+    guard !value.isEmpty else { return "" }
+    while value.contains("//") {
+      value = value.replacingOccurrences(of: "//", with: "/")
+    }
+    if value != "~", !value.hasPrefix("~/") {
+      value = (value as NSString).standardizingPath.decomposedStringWithCanonicalMapping
+    }
     while value.count > 1, value.hasSuffix("/") {
       value.removeLast()
-    }
-    if value == "." || value == "~" || value == model.settings.remoteHome.trimmed {
-      return value
     }
     return value
   }
 
   private func sidebarProjectTitle(for rawPath: String) -> String {
     let path = normalizedSidebarProjectPath(rawPath)
+    let remoteHome = normalizedSidebarPathComponent(model.settings.remoteHome)
     guard !path.isEmpty else { return "No Folder" }
-    if path == "~" || path == model.settings.remoteHome.trimmed {
+    if path == "~" || (!remoteHome.isEmpty && path == remoteHome) {
       return "Home"
     }
     return path.split(separator: "/").last.map(String.init) ?? path
@@ -354,7 +416,7 @@ struct RootView: View {
   private func shortSidebarPath(_ rawPath: String) -> String {
     let path = normalizedSidebarProjectPath(rawPath)
     guard !path.isEmpty else { return "" }
-    let remoteHome = model.settings.remoteHome.trimmed
+    let remoteHome = normalizedSidebarPathComponent(model.settings.remoteHome)
     guard !remoteHome.isEmpty else { return path }
     if path == remoteHome { return "~" }
     if path.hasPrefix(remoteHome + "/") {
@@ -420,6 +482,8 @@ private struct SidebarProjectGroup: Identifiable {
   var sessions: [SessionCard]
   var hasWorking: Bool
   var updatedAt: Date
+  var symbol: String = "folder"
+  var isPinnedGroup: Bool = false
 }
 
 private struct SidebarProjectHeaderRow: View {
@@ -430,12 +494,14 @@ private struct SidebarProjectHeaderRow: View {
   var isSelected: Bool
   var isExpanded: Bool
   var sessionCount: Int
+  var symbol: String = "folder"
+  var hidesChevron = false
   var action: () -> Void
 
   var body: some View {
     Button(action: action) {
       HStack(spacing: 9) {
-        Image(systemName: "folder")
+        Image(systemName: symbol)
           .font(.system(size: 15, weight: .semibold))
           .frame(width: 20)
           .foregroundStyle(.secondary)
@@ -469,10 +535,12 @@ private struct SidebarProjectHeaderRow: View {
             .frame(height: 18)
             .background(Color.primary.opacity(colorScheme == .dark ? 0.10 : 0.055), in: Capsule())
         }
-        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-          .font(.system(size: 10, weight: .bold))
-          .foregroundStyle(.secondary.opacity(0.76))
-          .frame(width: 12)
+        if !hidesChevron {
+          Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+            .font(.system(size: 10, weight: .bold))
+            .foregroundStyle(.secondary.opacity(0.76))
+            .frame(width: 12)
+        }
       }
       .padding(.horizontal, 8)
       .padding(.vertical, 6)
@@ -716,6 +784,12 @@ private struct SidebarSessionRow: View {
           Text(compact(session.displayTitle, limit: showsPath ? 56 : 58))
             .font(.callout.weight(isSelected ? .semibold : .medium))
             .lineLimit(1)
+          if session.isPinned {
+            Image(systemName: "pin.fill")
+              .font(.system(size: 10, weight: .semibold))
+              .foregroundStyle(.secondary.opacity(0.72))
+              .safeHelp("Pinned")
+          }
           Spacer(minLength: 0)
           if !showsPath, !isWorking {
             Text(relativeAge)

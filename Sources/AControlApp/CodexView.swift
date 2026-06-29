@@ -1055,10 +1055,10 @@ private struct CodexPromptPanel: View {
 
             Spacer(minLength: 8)
 
-            if model.isProcessingCodexPromptQueue {
+            if model.isProcessingCodexPromptQueue || model.isSnapshottingCodexAttachments {
               ProgressView()
                 .controlSize(.small)
-                .safeHelp("Sending queued prompt")
+                .safeHelp(model.isSnapshottingCodexAttachments ? "Snapshotting attachments" : "Sending queued prompt")
             }
 
             CodexPromptControls(
@@ -1074,19 +1074,7 @@ private struct CodexPromptPanel: View {
             .frame(minWidth: 0, maxWidth: 1040, alignment: .trailing)
             .layoutPriority(3)
 
-            CodexGoalRuntimeControls(
-              markGoal: { markDraftAsGoal() },
-              refreshStatus: { Task { await model.codexSlash("/status") } },
-              pause: { Task { await model.codexKey("esc") } },
-              resume: { Task { await model.codexKey("enter") } }
-            )
-
-            AgentChoiceControls(
-              onUp: { Task { await model.codexKey("up") } },
-              onDown: { Task { await model.codexKey("down") } },
-              onEnter: { Task { await model.codexKey("enter") } },
-              onEscape: { Task { await model.codexKey("esc") } }
-            )
+            runtimeOverflowMenu
 
             steerSubmitButton
 
@@ -1098,6 +1086,7 @@ private struct CodexPromptPanel: View {
             ) {
               submit(steer: false)
             }
+            .disabled(model.isSnapshottingCodexAttachments)
           }
           .padding(.horizontal, 14)
           .padding(.vertical, 10)
@@ -1180,6 +1169,44 @@ private struct CodexPromptPanel: View {
     draft = "Pursue this goal:\n\(clean)"
   }
 
+  private var runtimeOverflowMenu: some View {
+    Menu {
+      Button("Mark Draft as Goal") {
+        markDraftAsGoal()
+      }
+      Button("Refresh Codex Status") {
+        Task { await model.codexSlash("/status") }
+      }
+      Divider()
+      Button("Pause / Escape") {
+        Task { await model.codexKey("esc") }
+      }
+      Button("Resume / Enter") {
+        Task { await model.codexKey("enter") }
+      }
+      Divider()
+      Button("Choice Up") {
+        Task { await model.codexKey("up") }
+      }
+      Button("Choice Down") {
+        Task { await model.codexKey("down") }
+      }
+    } label: {
+      Image(systemName: "ellipsis.circle")
+        .font(.system(size: 15, weight: .semibold))
+        .frame(width: 34, height: 34)
+        .contentShape(Circle())
+    }
+    .menuStyle(.button)
+    .buttonStyle(ImmediateFeedbackButtonStyle())
+    .foregroundStyle(.secondary)
+    .background(AControlStyle.insetFill(colorScheme), in: Circle())
+    .overlay {
+      Circle().strokeBorder(AControlStyle.hairline(colorScheme), lineWidth: 1)
+    }
+    .safeHelp("Goal, status, pause/resume, and choice controls")
+  }
+
   private var steerSubmitButton: some View {
     Button {
       submit(steer: true)
@@ -1191,7 +1218,7 @@ private struct CodexPromptPanel: View {
         .frame(height: 34)
     }
     .buttonStyle(ImmediateFeedbackButtonStyle())
-    .disabled(!canSteerCodex)
+    .disabled(!canSteerCodex || model.isSnapshottingCodexAttachments)
     .foregroundStyle(
       canSteerCodex
         ? AControlStyle.accentForeground(.blue, colorScheme)
@@ -1596,7 +1623,7 @@ private struct CodexQueueChip: View {
       Spacer(minLength: 8)
 
       HStack(spacing: 5) {
-        if item.kind == .send && (item.status == .queued || item.status == .waitingForCodex) {
+        if model.canPromoteCodexQueueItemToSteer(item) {
           queueTextButton(
             "Steer",
             symbol: "arrow.triangle.turn.up.right.diamond",
@@ -1607,19 +1634,6 @@ private struct CodexQueueChip: View {
               : "Send this queued item as steer"
           ) {
             model.promoteCodexQueueItemToSteer(item.id)
-          }
-        }
-        if item.kind == .steer && (item.status == .queued || item.status == .waitingForCodex) {
-          queueTextButton(
-            "Send",
-            symbol: "paperplane",
-            tint: .blue,
-            isDisabled: false,
-            help: item.status == .waitingForCodex
-              ? "Cancel this A queued steer and resend it as a normal prompt if it has not started yet"
-              : "Send this queued item as a normal prompt"
-          ) {
-            model.demoteCodexQueueItemToSend(item.id)
           }
         }
         if item.status == .failed {
@@ -2553,6 +2567,49 @@ struct ComposerContextChip: View {
   }
 }
 
+private enum CodexTranscriptScrollMode: String, CaseIterable, Identifiable {
+  case pinBottom
+  case automatic
+  case manual
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .pinBottom: "Pin bottom"
+    case .automatic: "Auto"
+    case .manual: "Manual"
+    }
+  }
+
+  var shortTitle: String {
+    switch self {
+    case .pinBottom: "Pinned"
+    case .automatic: "Auto"
+    case .manual: "Manual"
+    }
+  }
+
+  var symbol: String {
+    switch self {
+    case .pinBottom: "pin.fill"
+    case .automatic: "arrow.down.to.line.compact"
+    case .manual: "hand.raised"
+    }
+  }
+
+  var help: String {
+    switch self {
+    case .pinBottom:
+      "Always keep the transcript at the newest line."
+    case .automatic:
+      "Follow new transcript lines only while you are already near the bottom."
+    case .manual:
+      "Do not move the transcript when new lines arrive."
+    }
+  }
+}
+
 struct CodexTranscriptCard: View {
   enum TranscriptStyle {
     case codexActivity
@@ -2561,6 +2618,8 @@ struct CodexTranscriptCard: View {
 
   @EnvironmentObject private var model: AppModel
   @Environment(\.colorScheme) private var colorScheme
+  @AppStorage("AControl.codexTranscriptScrollMode") private var transcriptScrollModeRaw =
+    CodexTranscriptScrollMode.automatic.rawValue
   @State private var scrollSignal = 0
   @State private var sessionScrollSignal = 0
   @State private var followTailSignal = 0
@@ -2568,8 +2627,10 @@ struct CodexTranscriptCard: View {
   @State private var userHasScrolledAway = false
   @State private var wheelScrollButtonFallback = false
   @State private var scrollButtonSuppressed = false
-  @State private var suppressAwayReportsUntil = Date.distantPast
-  @State private var recentUserScrollUntil = Date.distantPast
+  @State private var transcriptTailLocked = true
+  @State private var observedUserScrollSinceLastBottom = false
+  @State private var preserveTranscriptScrollSignal = 0
+  @State private var preserveTranscriptBottomDistance: CGFloat?
   @State private var transcriptScheme: ColorScheme?
   @State private var transcriptDistanceToBottom: CGFloat = 0
   var text: String
@@ -2595,6 +2656,10 @@ struct CodexTranscriptCard: View {
     transcriptScheme ?? colorScheme
   }
 
+  private var transcriptScrollMode: CodexTranscriptScrollMode {
+    CodexTranscriptScrollMode(rawValue: transcriptScrollModeRaw) ?? .automatic
+  }
+
   private var canUseTranscriptActions: Bool {
     !text.trimmed.isEmpty
   }
@@ -2607,7 +2672,7 @@ struct CodexTranscriptCard: View {
   }
 
   private var isVisiblyFollowingTail: Bool {
-    !showScrollToBottomButton
+    transcriptScrollMode == .pinBottom || !showScrollToBottomButton
   }
 
   private var workingLabel: String {
@@ -2636,7 +2701,7 @@ struct CodexTranscriptCard: View {
     guard !clean.isEmpty else { return nil }
     let lower = clean.lowercased()
     guard lower.contains("reset") || lower.contains("resets") else { return nil }
-    return clean
+    return CodexTokenResetNormalizer.normalizeSummary(clean)
   }
 
   var body: some View {
@@ -2678,6 +2743,7 @@ struct CodexTranscriptCard: View {
           TranscriptTailStatePill(
             isAtBottom: isVisiblyFollowingTail,
             isWorking: isWorking,
+            mode: transcriptScrollMode,
             colorScheme: colorScheme
           )
         }
@@ -2689,14 +2755,12 @@ struct CodexTranscriptCard: View {
             .padding(.vertical, 4)
             .background(AControlStyle.insetFill(colorScheme), in: Capsule())
         }
-        HStack(spacing: 5) {
-          transcriptHeaderButton(
-            symbol: "arrow.clockwise",
-            help: "Refresh transcript"
-          ) {
-            Task { await model.syncServerCodexHistoryAndRefreshVisibleSession() }
-          }
-          if canUseTranscriptActions {
+        if showsWeeklyStatus {
+          tokenStatusButton
+        }
+        scrollModePicker
+        if canUseTranscriptActions {
+          HStack(spacing: 5) {
             transcriptHeaderButton(
               symbol: "doc.on.doc",
               help: "Copy transcript"
@@ -2711,23 +2775,6 @@ struct CodexTranscriptCard: View {
             }
           }
         }
-        if showsWeeklyStatus {
-          Button(action: refreshTokens) {
-            HStack(spacing: 6) {
-              Image(systemName: "gauge.with.dots.needle.67percent")
-              Text(tokenSummary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.82)
-            }
-            .font(.caption.weight(.bold))
-            .foregroundStyle(AControlStyle.accentForeground(.cyan, colorScheme))
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .background(AControlStyle.accentFill(.cyan, colorScheme), in: Capsule())
-          }
-          .buttonStyle(ImmediateFeedbackButtonStyle())
-          .safeHelp(reset.isEmpty ? "Update token status" : reset)
-        }
       }
       .frame(minHeight: 30)
 
@@ -2739,8 +2786,21 @@ struct CodexTranscriptCard: View {
 
         TranscriptScrollWheelSniffer {
           guard text.trimmed.count > 600 else { return }
-          recentUserScrollUntil = Date().addingTimeInterval(2.0)
-          guard Date() >= suppressAwayReportsUntil else { return }
+          if transcriptScrollMode == .pinBottom {
+            transcriptTailLocked = true
+            observedUserScrollSinceLastBottom = false
+            userHasScrolledAway = false
+            wheelScrollButtonFallback = false
+            if !transcriptAtBottom || transcriptDistanceToBottom > 8 {
+              DispatchQueue.main.async {
+                scrollSignal += 1
+              }
+            }
+            return
+          }
+          observedUserScrollSinceLastBottom = true
+          transcriptTailLocked = false
+          scrollButtonSuppressed = false
           guard !transcriptAtBottom else {
             wheelScrollButtonFallback = false
             userHasScrolledAway = false
@@ -2760,6 +2820,8 @@ struct CodexTranscriptCard: View {
         ) {
           wheelScrollButtonFallback = false
           scrollButtonSuppressed = false
+          transcriptTailLocked = true
+          observedUserScrollSinceLastBottom = false
           userHasScrolledAway = false
           transcriptAtBottom = true
           transcriptDistanceToBottom = 0
@@ -2768,78 +2830,57 @@ struct CodexTranscriptCard: View {
       }
       .onChange(of: text) { _, _ in
         guard !isLoadingMoreTranscript else { return }
-        guard !userHasScrolledAway else { return }
-        suppressAwayReportsUntil = Date().addingTimeInterval(0.65)
-        userHasScrolledAway = false
-        wheelScrollButtonFallback = false
-        transcriptAtBottom = true
-        transcriptDistanceToBottom = 0
-        DispatchQueue.main.async {
-          followTailSignal += 1
+        switch transcriptScrollMode {
+        case .pinBottom:
+          scrollButtonSuppressed = false
+          userHasScrolledAway = false
+          wheelScrollButtonFallback = false
+          observedUserScrollSinceLastBottom = false
+          transcriptTailLocked = true
+          transcriptAtBottom = true
+          transcriptDistanceToBottom = 0
           scrollSignal += 1
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-            scrollSignal += 1
+        case .automatic:
+          guard transcriptTailLocked && !userHasScrolledAway else {
+            scrollButtonSuppressed = false
+            return
           }
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.34) {
-            scrollSignal += 1
-          }
+          scrollButtonSuppressed = false
+          userHasScrolledAway = false
+          wheelScrollButtonFallback = false
+          transcriptAtBottom = true
+          transcriptDistanceToBottom = 0
+          followTailSignal += 1
+        case .manual:
+          scrollButtonSuppressed = false
         }
       }
       .onChange(of: scrollRequest) { _, _ in
-        guard transcriptAtBottom && !userHasScrolledAway else {
+        guard transcriptScrollMode != .manual else {
           scrollButtonSuppressed = false
           return
         }
-        suppressAwayReportsUntil = Date().addingTimeInterval(0.75)
-        scrollButtonSuppressed = true
+        guard transcriptScrollMode == .pinBottom || (transcriptTailLocked && transcriptAtBottom && !userHasScrolledAway)
+        else {
+          scrollButtonSuppressed = false
+          return
+        }
+        scrollButtonSuppressed = false
         userHasScrolledAway = false
         wheelScrollButtonFallback = false
         transcriptAtBottom = true
         transcriptDistanceToBottom = 0
-        DispatchQueue.main.async {
-          scrollSignal += 1
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) {
-            transcriptAtBottom = true
-            transcriptDistanceToBottom = 0
-            scrollButtonSuppressed = false
-          }
-        }
+        scrollSignal += 1
       }
       .onChange(of: sessionID) { _, _ in
-        suppressAwayReportsUntil = Date().addingTimeInterval(1.2)
-        scrollButtonSuppressed = true
-        recentUserScrollUntil = .distantPast
+        scrollButtonSuppressed = false
+        transcriptTailLocked = transcriptScrollMode != .manual
+        observedUserScrollSinceLastBottom = false
         transcriptAtBottom = true
         transcriptDistanceToBottom = 0
         userHasScrolledAway = false
         wheelScrollButtonFallback = false
-        DispatchQueue.main.async {
-          sessionScrollSignal += 1
-          scrollSignal += 1
-          userHasScrolledAway = false
-          wheelScrollButtonFallback = false
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-            transcriptAtBottom = true
-            transcriptDistanceToBottom = 0
-            userHasScrolledAway = false
-            wheelScrollButtonFallback = false
-            scrollSignal += 1
-          }
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) {
-            transcriptAtBottom = true
-            transcriptDistanceToBottom = 0
-            userHasScrolledAway = false
-            wheelScrollButtonFallback = false
-            scrollSignal += 1
-          }
-          DispatchQueue.main.asyncAfter(deadline: .now() + 1.25) {
-            scrollButtonSuppressed = false
-            if transcriptAtBottom {
-              userHasScrolledAway = false
-              wheelScrollButtonFallback = false
-            }
-          }
-        }
+        sessionScrollSignal += 1
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -2856,20 +2897,42 @@ struct CodexTranscriptCard: View {
         sessionResetSignal: sessionScrollSignal,
         followTailSignal: followTailSignal,
         userIsReadingHistory: userHasScrolledAway,
+        autoScrollsToBottom: transcriptScrollMode != .manual,
+        pinBottom: transcriptScrollMode == .pinBottom,
         canLoadMore: canLoadMoreTranscript,
         isLoadingMore: isLoadingMoreTranscript,
-        loadMore: loadMoreTranscript,
+        loadMore: {
+          preserveTranscriptBottomDistance = max(0, transcriptDistanceToBottom)
+          preserveTranscriptScrollSignal += 1
+          transcriptTailLocked = false
+          observedUserScrollSinceLastBottom = true
+          userHasScrolledAway = true
+          wheelScrollButtonFallback = true
+          scrollButtonSuppressed = false
+          loadMoreTranscript()
+        },
+        preserveBottomDistanceSignal: preserveTranscriptScrollSignal,
+        preserveBottomDistance: preserveTranscriptBottomDistance,
         onBottomStateChange: { visible, distance in
           transcriptAtBottom = visible
           transcriptDistanceToBottom = distance
           if visible {
+            transcriptTailLocked = transcriptScrollMode != .manual
+            observedUserScrollSinceLastBottom = false
             userHasScrolledAway = false
             wheelScrollButtonFallback = false
-          } else if Date() < suppressAwayReportsUntil {
+            scrollButtonSuppressed = false
+          } else if transcriptScrollMode == .pinBottom {
+            transcriptTailLocked = true
             userHasScrolledAway = false
             wheelScrollButtonFallback = false
-          } else if Date() < recentUserScrollUntil {
+            DispatchQueue.main.async {
+              scrollSignal += 1
+            }
+          } else if observedUserScrollSinceLastBottom || !transcriptTailLocked {
+            transcriptTailLocked = false
             userHasScrolledAway = true
+            wheelScrollButtonFallback = true
           } else {
             wheelScrollButtonFallback = false
           }
@@ -2882,18 +2945,27 @@ struct CodexTranscriptCard: View {
         placeholder: placeholder,
         scrollSignal: scrollSignal,
         followTailSignal: followTailSignal,
-        autoScrollsOnTextChange: true,
+        autoScrollsOnTextChange: transcriptScrollMode != .manual,
         onBottomStateChange: { visible in
           transcriptAtBottom = visible
           transcriptDistanceToBottom = visible ? 0 : max(transcriptDistanceToBottom, 320)
           if visible {
+            transcriptTailLocked = transcriptScrollMode != .manual
+            observedUserScrollSinceLastBottom = false
             userHasScrolledAway = false
             wheelScrollButtonFallback = false
-          } else if Date() < suppressAwayReportsUntil {
+            scrollButtonSuppressed = false
+          } else if transcriptScrollMode == .pinBottom {
+            transcriptTailLocked = true
             userHasScrolledAway = false
             wheelScrollButtonFallback = false
-          } else if Date() < recentUserScrollUntil {
+            DispatchQueue.main.async {
+              scrollSignal += 1
+            }
+          } else if observedUserScrollSinceLastBottom || !transcriptTailLocked {
+            transcriptTailLocked = false
             userHasScrolledAway = true
+            wheelScrollButtonFallback = true
           } else {
             wheelScrollButtonFallback = false
           }
@@ -2910,6 +2982,72 @@ struct CodexTranscriptCard: View {
       return "Checked \(checked.shortStamp)"
     }
     return nil
+  }
+
+  private var tokenStatusButton: some View {
+    Button(action: refreshTokens) {
+      HStack(spacing: 6) {
+        Image(systemName: "gauge.with.dots.needle.67percent")
+        Text(tokenSummary)
+          .lineLimit(1)
+          .minimumScaleFactor(0.75)
+      }
+      .font(.caption.weight(.bold))
+      .foregroundStyle(AControlStyle.accentForeground(.cyan, colorScheme))
+      .padding(.horizontal, 10)
+      .padding(.vertical, 5)
+      .frame(maxWidth: 260)
+      .background(AControlStyle.accentFill(.cyan, colorScheme), in: Capsule())
+    }
+    .buttonStyle(ImmediateFeedbackButtonStyle())
+    .fixedSize(horizontal: false, vertical: true)
+    .safeHelp(reset.isEmpty ? "Update token status" : reset)
+  }
+
+  private var scrollModePicker: some View {
+    Menu {
+      ForEach(CodexTranscriptScrollMode.allCases) { mode in
+        Button {
+          transcriptScrollModeRaw = mode.rawValue
+          scrollButtonSuppressed = false
+          switch mode {
+          case .pinBottom:
+            transcriptTailLocked = true
+            observedUserScrollSinceLastBottom = false
+            userHasScrolledAway = false
+            wheelScrollButtonFallback = false
+            transcriptAtBottom = true
+            transcriptDistanceToBottom = 0
+            scrollSignal += 1
+          case .automatic:
+            transcriptTailLocked = transcriptAtBottom && !userHasScrolledAway
+          case .manual:
+            transcriptTailLocked = false
+          }
+        } label: {
+          Label(mode.title, systemImage: mode.symbol)
+        }
+        .safeHelp(mode.help)
+      }
+    } label: {
+      HStack(spacing: 6) {
+        Image(systemName: transcriptScrollMode.symbol)
+          .font(.system(size: 10.5, weight: .semibold))
+        Text(transcriptScrollMode.shortTitle)
+          .font(.caption.weight(.bold))
+          .lineLimit(1)
+      }
+      .foregroundStyle(.secondary)
+      .padding(.horizontal, 9)
+      .frame(height: 26)
+      .background(AControlStyle.insetFill(colorScheme), in: Capsule())
+      .overlay {
+        Capsule().strokeBorder(AControlStyle.hairline(colorScheme), lineWidth: 1)
+      }
+    }
+    .menuStyle(.borderlessButton)
+    .fixedSize()
+    .safeHelp(transcriptScrollMode.help)
   }
 
   private func transcriptHeaderButton(
@@ -2936,14 +3074,19 @@ struct CodexTranscriptCard: View {
 private struct TranscriptTailStatePill: View {
   var isAtBottom: Bool
   var isWorking: Bool
+  var mode: CodexTranscriptScrollMode
   var colorScheme: ColorScheme
 
   private var tint: Color {
+    if mode == .manual { return .gray }
+    if mode == .pinBottom { return .green }
     if isWorking { return .blue }
     return isAtBottom ? .green : .orange
   }
 
   private var label: String {
+    if mode == .manual { return "Manual" }
+    if mode == .pinBottom { return "Pinned" }
     if isWorking && isAtBottom { return "Live" }
     if isWorking { return "Paused" }
     return isAtBottom ? "Tail" : "Paused"
@@ -3054,15 +3197,23 @@ struct CodexActivityTranscriptView: View {
   var sessionResetSignal: Int = 0
   var followTailSignal: Int
   var userIsReadingHistory = false
+  var autoScrollsToBottom = true
+  var pinBottom = false
   var canLoadMore = false
   var isLoadingMore = false
   var loadMore: () -> Void = {}
+  var preserveBottomDistanceSignal = 0
+  var preserveBottomDistance: CGFloat?
   var onBottomStateChange: ((Bool, CGFloat) -> Void)?
   var usesPanelChrome = true
   @State private var isAtBottom = true
   @State private var pendingAutoScrollTask: Task<Void, Never>?
   @State private var lastAutoScrollAt = Date.distantPast
   @State private var pendingSessionResetScrollSignal: Int?
+  @State private var pendingPreservedBottomDistance: CGFloat?
+  @State private var preserveRequestParseKey: String?
+  @State private var restoreBottomDistanceSignal = 0
+  @State private var restoreBottomDistance: CGFloat?
   @State private var parsedItems: [CodexActivityItem] = []
   @State private var expandedTextIDs: Set<String> = []
 
@@ -3175,7 +3326,9 @@ struct CodexActivityTranscriptView: View {
         CodexScrollPositionObserver(
           isAtBottom: $isAtBottom,
           tolerance: CodexTranscriptTuning.bottomTolerance,
-          scrollSignal: scrollSignal
+          scrollSignal: scrollSignal,
+          restoreDistanceSignal: restoreBottomDistanceSignal,
+          restoreBottomDistance: restoreBottomDistance
         ) { visible, distance in
           onBottomStateChange?(visible, distance)
         }
@@ -3194,9 +3347,30 @@ struct CodexActivityTranscriptView: View {
         resetForSessionChange(newValue, proxy: proxy)
       }
       .onChange(of: followTailSignal) { _, _ in
-        scheduleScrollToBottom(proxy, force: !userIsReadingHistory, delay: 70_000_000)
+        guard autoScrollsToBottom else { return }
+        scheduleScrollToBottom(proxy, force: pinBottom || !userIsReadingHistory, delay: 70_000_000)
+      }
+      .onChange(of: autoScrollsToBottom) { _, newValue in
+        if !newValue {
+          pendingAutoScrollTask?.cancel()
+          pendingSessionResetScrollSignal = nil
+          pendingPreservedBottomDistance = nil
+          preserveRequestParseKey = nil
+        }
+      }
+      .onChange(of: isLoadingMore) { oldValue, newValue in
+        guard oldValue, !newValue else { return }
+        if pendingPreservedBottomDistance != nil, preserveRequestParseKey == parseKey {
+          pendingPreservedBottomDistance = nil
+          preserveRequestParseKey = nil
+        }
+      }
+      .onChange(of: preserveBottomDistanceSignal) { _, _ in
+        pendingPreservedBottomDistance = preserveBottomDistance
+        preserveRequestParseKey = parseKey
       }
       .onAppear {
+        guard autoScrollsToBottom else { return }
         scheduleScrollToBottom(proxy, force: true, delay: 90_000_000)
       }
       .task(id: parseKey) {
@@ -3211,24 +3385,32 @@ struct CodexActivityTranscriptView: View {
         let nextItems = parsed.enumerated().map { index, item in
           item.withStableID(index: index)
         }
-        let shouldKeepPinned = !userIsReadingHistory
-        let shouldForceForSession = pendingSessionResetScrollSignal == sessionResetSignal
+        let shouldKeepPinned = pinBottom || (autoScrollsToBottom && !userIsReadingHistory)
+        let shouldForceForSession = autoScrollsToBottom && pendingSessionResetScrollSignal == sessionResetSignal
         parsedItems = nextItems
-        if shouldForceForSession {
+        if let distance = pendingPreservedBottomDistance, !shouldForceForSession {
+          pendingPreservedBottomDistance = nil
+          preserveRequestParseKey = nil
+          restoreBottomDistance = distance
+          restoreBottomDistanceSignal += 1
+        } else if shouldForceForSession {
+          pendingPreservedBottomDistance = nil
+          preserveRequestParseKey = nil
           isAtBottom = true
           scheduleScrollToBottom(proxy, force: true, notify: true, delay: 30_000_000)
           if hasTranscriptText {
             pendingSessionResetScrollSignal = nil
           }
         } else if shouldKeepPinned {
-          scheduleScrollToBottom(proxy, force: false, delay: 50_000_000)
+          preserveRequestParseKey = nil
+          scheduleScrollToBottom(proxy, force: true, delay: 50_000_000)
         }
       }
     }
   }
 
   private var canFollowTail: Bool {
-    !userIsReadingHistory && isAtBottom
+    pinBottom || (autoScrollsToBottom && !userIsReadingHistory && isAtBottom)
   }
 
   private func scheduleScrollToBottom(
@@ -3248,7 +3430,18 @@ struct CodexActivityTranscriptView: View {
   }
 
   private func resetForSessionChange(_ signal: Int, proxy: ScrollViewProxy) {
+    guard autoScrollsToBottom else {
+      pendingSessionResetScrollSignal = nil
+      pendingPreservedBottomDistance = nil
+      preserveRequestParseKey = nil
+      expandedTextIDs.removeAll()
+      pendingAutoScrollTask?.cancel()
+      lastAutoScrollAt = .distantPast
+      return
+    }
     pendingSessionResetScrollSignal = signal
+    pendingPreservedBottomDistance = nil
+    preserveRequestParseKey = nil
     expandedTextIDs.removeAll()
     isAtBottom = true
     lastAutoScrollAt = .distantPast
@@ -3278,12 +3471,15 @@ private struct CodexScrollPositionObserver: NSViewRepresentable {
   @Binding var isAtBottom: Bool
   var tolerance: CGFloat
   var scrollSignal: Int
+  var restoreDistanceSignal: Int = 0
+  var restoreBottomDistance: CGFloat?
   var onBottomStateChange: (Bool, CGFloat) -> Void
 
   func makeNSView(context: Context) -> ObserverView {
     let view = ObserverView()
     view.tolerance = tolerance
     view.lastScrollSignal = scrollSignal
+    view.lastRestoreDistanceSignal = restoreDistanceSignal
     view.onBottomStateChange = { visible, distance in
       if isAtBottom != visible {
         isAtBottom = visible
@@ -3305,7 +3501,13 @@ private struct CodexScrollPositionObserver: NSViewRepresentable {
       view.attachIfNeeded()
       if view.lastScrollSignal != scrollSignal {
         view.lastScrollSignal = scrollSignal
-        view.scrollToBottom(repeating: true)
+        view.scrollToBottom(repeating: false)
+      }
+      if view.lastRestoreDistanceSignal != restoreDistanceSignal {
+        view.lastRestoreDistanceSignal = restoreDistanceSignal
+        if let restoreBottomDistance {
+          view.scrollToBottomDistance(restoreBottomDistance, repeating: false)
+        }
       }
       view.report()
     }
@@ -3315,6 +3517,7 @@ private struct CodexScrollPositionObserver: NSViewRepresentable {
   final class ObserverView: NSView {
     var tolerance: CGFloat = 64
     var lastScrollSignal = 0
+    var lastRestoreDistanceSignal = 0
     var onBottomStateChange: ((Bool, CGFloat) -> Void)?
     private weak var scrollView: NSScrollView?
     private var lastValue: Bool?
@@ -3420,6 +3623,17 @@ private struct CodexScrollPositionObserver: NSViewRepresentable {
       }
     }
 
+    func scrollToBottomDistance(_ distance: CGFloat, repeating: Bool = false) {
+      performScrollToBottomDistance(distance)
+      guard repeating else { return }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+        self?.performScrollToBottomDistance(distance)
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) { [weak self] in
+        self?.performScrollToBottomDistance(distance)
+      }
+    }
+
     private func performScrollToBottom() {
       guard let scrollView, let documentView = scrollView.documentView else { return }
       documentView.layoutSubtreeIfNeeded()
@@ -3428,6 +3642,21 @@ private struct CodexScrollPositionObserver: NSViewRepresentable {
         documentView.isFlipped
         ? max(0, documentView.bounds.maxY - scrollView.contentView.bounds.height)
         : documentView.bounds.minY
+      scrollView.contentView.scroll(to: NSPoint(x: 0, y: y))
+      scrollView.reflectScrolledClipView(scrollView.contentView)
+      report(force: true)
+    }
+
+    private func performScrollToBottomDistance(_ distance: CGFloat) {
+      guard let scrollView, let documentView = scrollView.documentView else { return }
+      documentView.layoutSubtreeIfNeeded()
+      scrollView.contentView.layoutSubtreeIfNeeded()
+      let visibleHeight = scrollView.contentView.bounds.height
+      let clampedDistance = max(0, distance)
+      let y =
+        documentView.isFlipped
+        ? max(0, documentView.bounds.maxY - visibleHeight - clampedDistance)
+        : documentView.bounds.minY + clampedDistance
       scrollView.contentView.scroll(to: NSPoint(x: 0, y: y))
       scrollView.reflectScrolledClipView(scrollView.contentView)
       report(force: true)
@@ -4348,9 +4577,11 @@ private enum CodexActivityParser {
     if !current.isEmpty {
       groups.append(current)
     }
-    let parsed = compactNoisyRepeats(
-      removePromptEchoes(
-        from: groups.compactMap(parseGroup).filter { !isGeneratedResearchActivity($0) }
+    let parsed = compactToolBursts(
+      compactNoisyRepeats(
+        removePromptEchoes(
+          from: groups.compactMap(parseGroup).filter { !isGeneratedResearchActivity($0) }
+        )
       )
     )
     if !parsed.isEmpty {
@@ -4723,6 +4954,16 @@ private enum CodexActivityParser {
         detail: detail,
         badge: "Wait", fileReferences: groupFileReferences)
     }
+    if isCodexNarrativeMarker(effectiveFirst) {
+      let body = codexNarrativeText(firstLine: effectiveFirst, detail: detail)
+      guard !body.isEmpty || !groupFileReferences.isEmpty else { return nil }
+      return CodexActivityItem(
+        kind: .result,
+        title: body.isEmpty ? "Codex update" : body,
+        detail: "",
+        badge: nil,
+        fileReferences: groupFileReferences)
+    }
     if isPatchHeaderLine(effectiveFirst) {
       return CodexActivityItem(
         kind: .edited,
@@ -4754,6 +4995,28 @@ private enum CodexActivityParser {
       detail: detail,
       badge: nil,
       fileReferences: groupFileReferences)
+  }
+
+  private static func isCodexNarrativeMarker(_ value: String) -> Bool {
+    value.range(
+      of: #"^•\s*(?:Codex|Assistant)\b[:：]?\s*"#,
+      options: [.regularExpression, .caseInsensitive]
+    ) != nil
+  }
+
+  private static func codexNarrativeText(firstLine: String, detail: String) -> String {
+    let inline =
+      firstLine
+      .replacingOccurrences(
+        of: #"^•\s*(?:Codex|Assistant)\b[:：]?\s*"#,
+        with: "",
+        options: [.regularExpression, .caseInsensitive]
+      )
+      .trimmed
+    return [inline, detail]
+      .map(\.trimmed)
+      .filter { !$0.isEmpty }
+      .joined(separator: "\n")
   }
 
   private static func looksLikeCodeLine(_ value: String) -> Bool {
@@ -5024,6 +5287,70 @@ private enum CodexActivityParser {
       output.append(item)
     }
     return output
+  }
+
+  private static func compactToolBursts(_ items: [CodexActivityItem]) -> [CodexActivityItem] {
+    var output: [CodexActivityItem] = []
+    var burst: [CodexActivityItem] = []
+
+    func flushBurst() {
+      guard !burst.isEmpty else { return }
+      defer { burst.removeAll(keepingCapacity: true) }
+      guard burst.count > 12 else {
+        output.append(contentsOf: burst)
+        return
+      }
+      let headCount = 3
+      let tailCount = 3
+      let hiddenCount = max(0, burst.count - headCount - tailCount)
+      output.append(contentsOf: burst.prefix(headCount))
+      output.append(
+        CodexActivityItem(
+          kind: .result,
+          title: toolBurstSummary(for: burst, hiddenCount: hiddenCount),
+          detail: "",
+          badge: nil,
+          fileReferences: []
+        )
+      )
+      output.append(contentsOf: burst.suffix(tailCount))
+    }
+
+    for item in items {
+      if isCompactableToolEvent(item) {
+        burst.append(item)
+      } else {
+        flushBurst()
+        output.append(item)
+      }
+    }
+    flushBurst()
+    return output
+  }
+
+  private static func isCompactableToolEvent(_ item: CodexActivityItem) -> Bool {
+    switch item.kind {
+    case .ran, .explored, .called, .waited:
+      true
+    default:
+      false
+    }
+  }
+
+  private static func toolBurstSummary(for items: [CodexActivityItem], hiddenCount: Int) -> String {
+    let reads = items.filter { $0.kind == .explored }.count
+    let runs = items.filter { $0.kind == .ran }.count
+    let tools = items.filter { $0.kind == .called }.count
+    let waits = items.filter { $0.kind == .waited }.count
+    var parts: [String] = []
+    if reads > 0 { parts.append("read \(reads)") }
+    if runs > 0 { parts.append("ran \(runs)") }
+    if tools > 0 { parts.append("called \(tools)") }
+    if waits > 0 { parts.append("waited \(waits)") }
+    let summary = parts.isEmpty ? "Processed tool activity" : parts.joined(separator: ", ")
+    return hiddenCount > 0
+      ? "\(summary) · \(hiddenCount) quieter tool events hidden"
+      : summary
   }
 
   private static func shouldCollapseActivity(
