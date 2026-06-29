@@ -4577,9 +4577,11 @@ private enum CodexActivityParser {
     if !current.isEmpty {
       groups.append(current)
     }
-    let parsed = compactNoisyRepeats(
-      removePromptEchoes(
-        from: groups.compactMap(parseGroup).filter { !isGeneratedResearchActivity($0) }
+    let parsed = compactToolBursts(
+      compactNoisyRepeats(
+        removePromptEchoes(
+          from: groups.compactMap(parseGroup).filter { !isGeneratedResearchActivity($0) }
+        )
       )
     )
     if !parsed.isEmpty {
@@ -4952,6 +4954,16 @@ private enum CodexActivityParser {
         detail: detail,
         badge: "Wait", fileReferences: groupFileReferences)
     }
+    if isCodexNarrativeMarker(effectiveFirst) {
+      let body = codexNarrativeText(firstLine: effectiveFirst, detail: detail)
+      guard !body.isEmpty || !groupFileReferences.isEmpty else { return nil }
+      return CodexActivityItem(
+        kind: .result,
+        title: body.isEmpty ? "Codex update" : body,
+        detail: "",
+        badge: nil,
+        fileReferences: groupFileReferences)
+    }
     if isPatchHeaderLine(effectiveFirst) {
       return CodexActivityItem(
         kind: .edited,
@@ -4983,6 +4995,28 @@ private enum CodexActivityParser {
       detail: detail,
       badge: nil,
       fileReferences: groupFileReferences)
+  }
+
+  private static func isCodexNarrativeMarker(_ value: String) -> Bool {
+    value.range(
+      of: #"^•\s*(?:Codex|Assistant)\b[:：]?\s*"#,
+      options: [.regularExpression, .caseInsensitive]
+    ) != nil
+  }
+
+  private static func codexNarrativeText(firstLine: String, detail: String) -> String {
+    let inline =
+      firstLine
+      .replacingOccurrences(
+        of: #"^•\s*(?:Codex|Assistant)\b[:：]?\s*"#,
+        with: "",
+        options: [.regularExpression, .caseInsensitive]
+      )
+      .trimmed
+    return [inline, detail]
+      .map(\.trimmed)
+      .filter { !$0.isEmpty }
+      .joined(separator: "\n")
   }
 
   private static func looksLikeCodeLine(_ value: String) -> Bool {
@@ -5253,6 +5287,70 @@ private enum CodexActivityParser {
       output.append(item)
     }
     return output
+  }
+
+  private static func compactToolBursts(_ items: [CodexActivityItem]) -> [CodexActivityItem] {
+    var output: [CodexActivityItem] = []
+    var burst: [CodexActivityItem] = []
+
+    func flushBurst() {
+      guard !burst.isEmpty else { return }
+      defer { burst.removeAll(keepingCapacity: true) }
+      guard burst.count > 12 else {
+        output.append(contentsOf: burst)
+        return
+      }
+      let headCount = 3
+      let tailCount = 3
+      let hiddenCount = max(0, burst.count - headCount - tailCount)
+      output.append(contentsOf: burst.prefix(headCount))
+      output.append(
+        CodexActivityItem(
+          kind: .result,
+          title: toolBurstSummary(for: burst, hiddenCount: hiddenCount),
+          detail: "",
+          badge: nil,
+          fileReferences: []
+        )
+      )
+      output.append(contentsOf: burst.suffix(tailCount))
+    }
+
+    for item in items {
+      if isCompactableToolEvent(item) {
+        burst.append(item)
+      } else {
+        flushBurst()
+        output.append(item)
+      }
+    }
+    flushBurst()
+    return output
+  }
+
+  private static func isCompactableToolEvent(_ item: CodexActivityItem) -> Bool {
+    switch item.kind {
+    case .ran, .explored, .called, .waited:
+      true
+    default:
+      false
+    }
+  }
+
+  private static func toolBurstSummary(for items: [CodexActivityItem], hiddenCount: Int) -> String {
+    let reads = items.filter { $0.kind == .explored }.count
+    let runs = items.filter { $0.kind == .ran }.count
+    let tools = items.filter { $0.kind == .called }.count
+    let waits = items.filter { $0.kind == .waited }.count
+    var parts: [String] = []
+    if reads > 0 { parts.append("read \(reads)") }
+    if runs > 0 { parts.append("ran \(runs)") }
+    if tools > 0 { parts.append("called \(tools)") }
+    if waits > 0 { parts.append("waited \(waits)") }
+    let summary = parts.isEmpty ? "Processed tool activity" : parts.joined(separator: ", ")
+    return hiddenCount > 0
+      ? "\(summary) · \(hiddenCount) quieter tool events hidden"
+      : summary
   }
 
   private static func shouldCollapseActivity(

@@ -5026,15 +5026,15 @@ include_all = scope in {"all", "global", "home"} or str(os.environ.get("A_COCKPI
     "1", "true", "yes", "all"
 }
 try:
-    output_limit = int(os.environ.get("A_COCKPIT_CODEX_HISTORY_LIMIT") or ("1000" if include_all else "600"))
+    output_limit = int(os.environ.get("A_COCKPIT_CODEX_HISTORY_LIMIT") or ("5000" if include_all else "2000"))
 except Exception:
-    output_limit = 1000 if include_all else 600
-output_limit = max(50, min(output_limit, 2000))
+    output_limit = 5000 if include_all else 2000
+output_limit = max(50, min(output_limit, 8000))
 try:
-    scan_limit = int(os.environ.get("A_COCKPIT_CODEX_HISTORY_SCAN_LIMIT") or ("1500" if include_all else "1000"))
+    scan_limit = int(os.environ.get("A_COCKPIT_CODEX_HISTORY_SCAN_LIMIT") or ("16000" if include_all else "8000"))
 except Exception:
-    scan_limit = 1500 if include_all else 1000
-scan_limit = max(50, min(scan_limit, 4000))
+    scan_limit = 16000 if include_all else 8000
+scan_limit = max(50, min(scan_limit, 24000))
 try:
     scan_age_days = float(os.environ.get("A_COCKPIT_CODEX_HISTORY_MAX_AGE_DAYS") or "0")
 except Exception:
@@ -6562,13 +6562,14 @@ try:
                 continue
         elif typ == "event_msg":
             event_type = str(payload.get("type") or "").lower()
-            if event_type in {"agent_message", "assistant_message", "message"}:
-                continue
             message = text_from_content(payload.get("message") or payload)
             if message:
                 clean_message = strip_hidden_prompt_context(message)
                 if clean_message:
-                    append_row(f"• {clean_message}")
+                    if event_type in {"agent_message", "assistant_message", "message"}:
+                        append_row(f"• Codex\n{clean_message}")
+                    else:
+                        append_row(f"• {clean_message}")
 except Exception as exc:
     print(f"Codex history transcript read failed: {exc}", file=sys.stderr)
     sys.exit(66)

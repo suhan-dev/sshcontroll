@@ -410,6 +410,7 @@ final class AppModel: ObservableObject {
     Task { [weak self] in
       try? await Task.sleep(nanoseconds: 900_000_000)
       guard let self else { return }
+      await self.importKnownProjectCodexHistorySessions()
       await self.syncCodexAppSessions(
         showsActivity: false,
         refreshWorkingAfter: true,
@@ -418,6 +419,48 @@ final class AppModel: ObservableObject {
         includeAllDirectories: true
       )
     }
+  }
+
+  private func importKnownProjectCodexHistorySessions() async {
+    let directories = warmCodexHistoryProjectDirectories()
+    guard !directories.isEmpty else { return }
+    for directory in directories {
+      await syncCodexAppSessions(
+        showsActivity: false,
+        force: true,
+        refreshWorkingAfter: false,
+        allowNewImports: true,
+        onlyCurrentDirectory: true,
+        includeAllDirectories: false,
+        directoryOverride: directory
+      )
+    }
+  }
+
+  private func warmCodexHistoryProjectDirectories() -> [String] {
+    var byDirectory: [String: (count: Int, updatedAt: Date)] = [:]
+    func add(_ rawDirectory: String, updatedAt: Date, count: Int = 1) {
+      let directory = normalizedRemotePath(rawDirectory)
+      guard !directory.isEmpty else { return }
+      let existing = byDirectory[directory] ?? (0, .distantPast)
+      byDirectory[directory] = (
+        existing.count + count,
+        max(existing.updatedAt, updatedAt)
+      )
+    }
+    add(currentRemoteDir, updatedAt: Date(), count: 4)
+    for session in sessions where !session.codexHistoryID.trimmed.isEmpty {
+      add(session.remoteDir, updatedAt: session.updatedAt)
+    }
+    return byDirectory
+      .sorted { first, second in
+        if first.value.count != second.value.count {
+          return first.value.count > second.value.count
+        }
+        return first.value.updatedAt > second.value.updatedAt
+      }
+      .prefix(8)
+      .map(\.key)
   }
 
   private func sessionSnapshot(for id: UUID?) -> SessionCard? {
@@ -3805,10 +3848,13 @@ final class AppModel: ObservableObject {
   func refreshCodexHistory(
     force: Bool = false,
     showsActivity: Bool? = nil,
-    includeAllDirectories: Bool = false
+    includeAllDirectories: Bool = false,
+    directoryOverride: String? = nil
   ) async {
+    let historyDirectory = normalizedRemotePath(
+      directoryOverride?.trimmed.nilIfEmpty ?? currentRemoteDir)
     if !force, let lastCodexHistoryRefresh,
-      lastCodexHistoryRefreshDirectory == normalizedRemotePath(currentRemoteDir),
+      lastCodexHistoryRefreshDirectory == historyDirectory,
       !includeAllDirectories,
       Date().timeIntervalSince(lastCodexHistoryRefresh) < 8
     {
@@ -3816,15 +3862,15 @@ final class AppModel: ObservableObject {
     }
     if !includeAllDirectories {
       lastCodexHistoryRefresh = Date()
-      lastCodexHistoryRefreshDirectory = normalizedRemotePath(currentRemoteDir)
+      lastCodexHistoryRefreshDirectory = historyDirectory
     }
     var remoteEnvironment = [
       "A_COCKPIT_CODEX_HISTORY_HOST": "remote"
     ]
     remoteEnvironment["A_COCKPIT_CODEX_HISTORY_LIMIT"] =
-      includeAllDirectories ? "1200" : "700"
+      includeAllDirectories ? "5000" : "2000"
     remoteEnvironment["A_COCKPIT_CODEX_HISTORY_SCAN_LIMIT"] =
-      includeAllDirectories ? "1800" : "1200"
+      includeAllDirectories ? "16000" : "8000"
     remoteEnvironment["A_COCKPIT_CODEX_HISTORY_MAX_AGE_DAYS"] = "0"
     if force {
       remoteEnvironment["A_COCKPIT_CODEX_HISTORY_FORCE"] = "1"
@@ -3834,7 +3880,7 @@ final class AppModel: ObservableObject {
       remoteEnvironment["A_COCKPIT_CODEX_HISTORY_SCOPE"] = "all"
     }
     let remoteResult = await runRemote(
-      "codex-history-json", input: currentRemoteDir + "\n", timeout: 30,
+      "codex-history-json", input: historyDirectory + "\n", timeout: includeAllDirectories ? 75 : 45,
       showsActivity: showsActivity ?? false,
       environmentOverride: remoteEnvironment)
     let prunedLocalSessions = pruneLocalCodexHistorySessions(save: false)
@@ -4200,9 +4246,6 @@ final class AppModel: ObservableObject {
   }
 
   private func shouldHideCodexHistoryRecordFromTopLevel(_ record: CodexHistoryRecord) -> Bool {
-    if record.isSpawnChild {
-      return true
-    }
     let title = titleForCodexRecord(record)
     let lower = title.lowercased()
     if lower.contains("subagent") || lower.contains("sub-agent") || lower.contains("sub agent")
@@ -4215,7 +4258,30 @@ final class AppModel: ObservableObject {
     {
       return true
     }
+    if record.isSpawnChild {
+      return !shouldShowSpawnChildCodexHistoryRecord(record, title: title)
+    }
     return false
+  }
+
+  private func shouldShowSpawnChildCodexHistoryRecord(
+    _ record: CodexHistoryRecord,
+    title: String
+  ) -> Bool {
+    let cleanTitle = cleanCodexHistoryTitle(title)?.trimmed ?? ""
+    guard cleanTitle.count >= 6 else { return false }
+    let cwd = normalizedRemotePath(record.cwd).lowercased()
+    let lower = cleanTitle.lowercased()
+    if cwd.contains("/desktop/dft"),
+      lower.range(of: #"^a\d+(?:\b|[-/ ])"#, options: .regularExpression) != nil
+    {
+      return true
+    }
+    return lower.hasPrefix("a0 ")
+      || lower.hasPrefix("a0-")
+      || lower.hasPrefix("a0/")
+      || lower.contains("central coordinator")
+      || lower.contains("central controller")
   }
 
   func importCodexHistorySessionsForCurrentDirectory() async {
@@ -4236,17 +4302,20 @@ final class AppModel: ObservableObject {
     refreshWorkingAfter: Bool = true,
     allowNewImports: Bool = false,
     onlyCurrentDirectory: Bool = false,
-    includeAllDirectories: Bool = false
+    includeAllDirectories: Bool = false,
+    directoryOverride: String? = nil
   ) async {
     await refreshCodexHistory(
       force: force,
       showsActivity: showsActivity,
-      includeAllDirectories: includeAllDirectories
+      includeAllDirectories: includeAllDirectories,
+      directoryOverride: directoryOverride
     )
     var existingIDs = Set(sessions.map { $0.codexHistoryID.trimmed }.filter { !$0.isEmpty })
     var changed = false
     if allowNewImports {
-      let currentDir = normalizedRemotePath(currentRemoteDir)
+      let currentDir = normalizedRemotePath(
+        directoryOverride?.trimmed.nilIfEmpty ?? currentRemoteDir)
       for record in codexHistoryRecords {
         let historyID = record.id.trimmed
         guard !historyID.isEmpty, !existingIDs.contains(historyID),
