@@ -171,17 +171,10 @@ struct RootView: View {
       uniqueKeysWithValues: model.sessions.enumerated().map { ($0.element.id, $0.offset) })
     let sortSessions: ([SessionCard]) -> [SessionCard] = { sessions in
       sessions.sorted { first, second in
-        let firstWorking =
-          model.codexWorkingSessionIDs.contains(first.id)
-          || model.claudeWorkingSessionIDs.contains(first.id)
-        let secondWorking =
-          model.codexWorkingSessionIDs.contains(second.id)
-          || model.claudeWorkingSessionIDs.contains(second.id)
-        if firstWorking != secondWorking { return firstWorking }
-        if firstWorking && secondWorking {
-          return (modelOrderIndex[first.id] ?? Int.max) < (modelOrderIndex[second.id] ?? Int.max)
+        if first.updatedAt != second.updatedAt {
+          return first.updatedAt > second.updatedAt
         }
-        return first.updatedAt > second.updatedAt
+        return (modelOrderIndex[first.id] ?? Int.max) < (modelOrderIndex[second.id] ?? Int.max)
       }
     }
     let grouped = Dictionary(grouping: projectSessions) { session in
@@ -205,8 +198,8 @@ struct RootView: View {
       )
     }
     var sortedGroups = groups.sorted { first, second in
-      if first.hasWorking != second.hasWorking { return first.hasWorking }
-      return first.updatedAt > second.updatedAt
+      if first.updatedAt != second.updatedAt { return first.updatedAt > second.updatedAt }
+      return first.title.localizedStandardCompare(second.title) == .orderedAscending
     }
     let pinnedSessions = sortSessions(searchableSessions.filter(\.isPinned))
     if !pinnedSessions.isEmpty {

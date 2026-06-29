@@ -5349,6 +5349,66 @@ def parse_index_time(value):
     except Exception:
         return 0
 
+latest_assistant_time_cache = {}
+
+def item_time(obj, payload=None, source=None):
+    payload = payload if isinstance(payload, dict) else obj.get("payload") if isinstance(obj, dict) else {}
+    source = source if isinstance(source, dict) else {}
+    for value in (
+        source.get("timestamp"),
+        source.get("created_at"),
+        source.get("updated_at"),
+        payload.get("timestamp") if isinstance(payload, dict) else "",
+        payload.get("created_at") if isinstance(payload, dict) else "",
+        payload.get("updated_at") if isinstance(payload, dict) else "",
+        obj.get("timestamp") if isinstance(obj, dict) else "",
+        obj.get("created_at") if isinstance(obj, dict) else "",
+        obj.get("updated_at") if isinstance(obj, dict) else "",
+    ):
+        parsed = parse_index_time(value)
+        if parsed:
+            return parsed
+    return 0
+
+def latest_assistant_mtime_from_path(path):
+    key = str(path)
+    if key in latest_assistant_time_cache:
+        return latest_assistant_time_cache[key]
+    latest_assistant_time_cache[key] = 0
+    if not path.exists():
+        return 0
+    fallback = 0
+    try:
+        fallback = int(path.stat().st_mtime)
+    except Exception:
+        fallback = 0
+    for line in reversed(tail_lines(path, max_bytes=2 * 1048576)):
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        payload = obj.get("payload") or {}
+        if obj.get("type") == "response_item":
+            item = payload.get("item")
+            source = item if isinstance(item, dict) else payload
+            role = (source.get("role") or payload.get("role") or "").lower()
+            kind = (source.get("type") or payload.get("type") or "").lower()
+            if role != "assistant" and kind not in ("assistant_message", "message", "output_text"):
+                continue
+            if not (item_text_for_title(source) or item_text_for_title(payload)):
+                continue
+            latest_assistant_time_cache[key] = item_time(obj, payload, source) or fallback
+            return latest_assistant_time_cache[key]
+        if obj.get("type") == "event_msg":
+            payload_type = str(payload.get("type") or "").lower()
+            if payload_type not in {"agent_message", "assistant_message", "message"}:
+                continue
+            if not text_from_content_for_title(payload.get("message") or payload):
+                continue
+            latest_assistant_time_cache[key] = item_time(obj, payload, {}) or fallback
+            return latest_assistant_time_cache[key]
+    return 0
+
 def normalized_path(value):
     text = str(value or "").strip()
     if not text:
@@ -5431,12 +5491,14 @@ if state_db.exists():
                     if expanded_rollout_path else ""
                 )
                 db_title = good_title(title)
+                indexed_title = good_title(index_titles.get(session_id, ""))
                 preview_title = good_title(preview)
                 first_message_title = good_title(first_user_message)
-                if is_auto_thread:
+                if indexed_title:
+                    clean_title = indexed_title
+                elif is_auto_thread:
                     clean_title = choose_best_title(
                         db_title,
-                        index_titles.get(session_id, ""),
                         first_message_title,
                         preview_title,
                         latest_title,
@@ -5444,20 +5506,23 @@ if state_db.exists():
                 else:
                     clean_title = choose_best_title(
                         db_title,
-                        index_titles.get(session_id, ""),
                         first_message_title,
                         preview_title,
                         latest_title,
                     )
                 if clean_title:
                     sqlite_titles[session_id] = clean_title
-                mtime = int(state_db.stat().st_mtime)
+                fallback_mtime = int(state_db.stat().st_mtime)
                 if expanded_rollout_path:
                     try:
-                        mtime = int(pathlib.Path(expanded_rollout_path).stat().st_mtime)
+                        fallback_mtime = int(pathlib.Path(expanded_rollout_path).stat().st_mtime)
                     except Exception:
                         pass
-                mtime = max(mtime, index_times.get(session_id, 0))
+                assistant_mtime = (
+                    latest_assistant_mtime_from_path(pathlib.Path(expanded_rollout_path))
+                    if expanded_rollout_path else 0
+                )
+                mtime = assistant_mtime or max(fallback_mtime, index_times.get(session_id, 0))
                 display_cwd = str(cwd or "").strip() or str(target)
                 if not include_all and not path_matches_target(cwd):
                     continue
@@ -5552,11 +5617,10 @@ for _, path, stat in scan_paths:
     sqlite_session_id = sqlite_paths.get(str(path), "")
     sqlite_title = sqlite_titles.get(session_id) or sqlite_titles.get(sqlite_session_id)
     meta_source = sqlite_meta.get(session_id) or sqlite_meta.get(sqlite_session_id) or {}
-    indexed_title = index_titles.get(session_id) or index_titles.get(sqlite_session_id)
+    indexed_title = good_title(index_titles.get(session_id) or index_titles.get(sqlite_session_id))
     latest_user_title = latest_user_title_from_path(path)
-    selected_title = choose_best_title(
+    selected_title = indexed_title or choose_best_title(
         sqlite_title,
-        indexed_title,
         first_user_title,
         latest_user_title,
         title,
@@ -5567,7 +5631,8 @@ for _, path, stat in scan_paths:
         "id": session_id,
         "cwd": display_cwd,
         "path": str(path),
-        "mtime": max(int(stat.st_mtime), index_times.get(session_id, 0), index_times.get(sqlite_session_id, 0)),
+        "mtime": latest_assistant_mtime_from_path(path)
+            or max(int(stat.st_mtime), index_times.get(session_id, 0), index_times.get(sqlite_session_id, 0)),
         "title": selected_title,
         "source": str(meta_source.get("source") or "cli"),
         "thread_source": str(meta_source.get("thread_source") or meta_thread_source or "user"),
@@ -5868,9 +5933,6 @@ def pane_looks_busy(text):
         "working (",
         "• working",
         "esc to interrupt",
-        "tab to queue message",
-        "작업 중",
-        "진행 중",
     ]):
         return True
     return any(line.strip().lower().startswith("thinking") for line in tail.splitlines())
@@ -6021,8 +6083,7 @@ for candidate in ordered_candidates[:250]:
                     live_text = compact_json_text(payload)
                     if any(marker in live_text for marker in [
                         "working", "thinking", "exec_command", "tool_call",
-                        "patch_apply", "function_call", "spawn_agent", "waited",
-                        "agent_message", "app_state", "screenshot",
+                        "patch_apply", "function_call", "spawn_agent",
                     ]):
                         latest_live_index = index
                         latest_live_text = live_text

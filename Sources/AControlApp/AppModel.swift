@@ -2762,20 +2762,7 @@ final class AppModel: ObservableObject {
   }
 
   private func sortSessionsByRecent() {
-    let originalIndex = Dictionary(uniqueKeysWithValues: sessions.enumerated().map { index, session in
-      (session.id, index)
-    })
     sessions.sort { first, second in
-      let firstWorking = codexWorkingSessionIDs.contains(first.id)
-        || claudeWorkingSessionIDs.contains(first.id)
-      let secondWorking = codexWorkingSessionIDs.contains(second.id)
-        || claudeWorkingSessionIDs.contains(second.id)
-      if firstWorking != secondWorking {
-        return firstWorking
-      }
-      if firstWorking && secondWorking {
-        return (originalIndex[first.id] ?? Int.max) < (originalIndex[second.id] ?? Int.max)
-      }
       if first.updatedAt != second.updatedAt {
         return first.updatedAt > second.updatedAt
       }
@@ -4383,20 +4370,9 @@ final class AppModel: ObservableObject {
     )
     var next = Set<UUID>()
     var explicitlyIdleSessionIDs = Set<UUID>()
-    var sessionsChanged = false
     for index in sessions.indices {
       let sessionID = sessions[index].id
       let historyID = sessions[index].codexHistoryID.trimmed
-      if let item = statusByHistoryID[historyID],
-        let mtime = item.mtime,
-        mtime > 0
-      {
-        let statusDate = Date(timeIntervalSince1970: TimeInterval(mtime))
-        if statusDate > sessions[index].updatedAt.addingTimeInterval(0.5) {
-          sessions[index].updatedAt = statusDate
-          sessionsChanged = true
-        }
-      }
       if !historyID.isEmpty, workingHistoryIDs.contains(historyID) {
         next.insert(sessionID)
         codexWorkingHoldUntil[sessionID] =
@@ -4446,9 +4422,6 @@ final class AppModel: ObservableObject {
     }
     codexWorkingStartedAtBySession = codexWorkingStartedAtBySession.filter { sessionID, _ in
       next.contains(sessionID)
-    }
-    if sessionsChanged {
-      saveSessions()
     }
     if next != codexWorkingSessionIDs {
       codexWorkingSessionIDs = next
@@ -5117,7 +5090,7 @@ final class AppModel: ObservableObject {
         let window = codexDisplayWindow(fromCachedHistory: cached, displayBytes: localNextBytes)
         let mergedInput = codexTranscriptPreservingLocalTurns(window)
         let merged = persistTranscript(.codex, value: mergedInput)
-        updateActiveCodexWorkingState(from: window, mayStart: true)
+        updateActiveCodexWorkingState(from: window, mayStart: false)
         updateCodexTranscriptLocalLoadMoreState()
         if setCodexTranscript(merged, force: true) {
           scheduleCodexTranscriptAnalysis()
@@ -5165,7 +5138,7 @@ final class AppModel: ObservableObject {
     let displayInput = codexDisplayWindow(fromCachedHistory: cachedInput, displayBytes: displayBytes)
     let mergedInput = codexTranscriptPreservingLocalTurns(displayInput)
     let merged = persistTranscript(.codex, value: mergedInput)
-    updateActiveCodexWorkingState(from: displayInput, mayStart: true)
+    updateActiveCodexWorkingState(from: displayInput, mayStart: false)
     if !historyID.isEmpty {
       codexHistoryTranscriptLoadedAtByID[historyID] = Date()
     }
