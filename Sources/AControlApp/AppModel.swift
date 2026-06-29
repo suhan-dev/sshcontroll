@@ -81,6 +81,7 @@ final class AppModel: ObservableObject {
   @Published var shellInput = ""
   @Published var shellCompletions: [ShellCompletion] = []
   @Published var activeFileTransfer: FileTransferProgress?
+  @Published var activeFileTransfers: [FileTransferProgress] = []
   @Published var fileTransferLogEntries: [String] = []
   @Published var codexInput = ""
   @Published var codexModel = "gpt-5.5"
@@ -93,6 +94,7 @@ final class AppModel: ObservableObject {
   @Published var codexTokenWeekly = "Tap Tokens"
   @Published var codexTokenReset = "Codex /status has not been read yet."
   @Published var codexAttachments: [PromptAttachment] = []
+  @Published var isSnapshottingCodexAttachments = false
   @Published var codexPromptQueue: [CodexPromptQueueItem] = [] {
     didSet {
       persistCodexPromptQueueIfReady()
@@ -187,7 +189,9 @@ final class AppModel: ObservableObject {
   private var lastCodexWorkingStateRefresh = Date.distantPast
   private var isRefreshingCodexWorkingStates = false
   private var isWarmingRecentCodexSessions = false
+  private var pendingForcedRecentCodexSessionWarm = false
   private var isPrewarmingVisibleCodexArtifacts = false
+  private var codexAttachmentSnapshotGeneration = UUID()
   private var codexArtifactPreviewRequestID = UUID()
   private var lastCodexUsefulCapture = Date.distantPast
   private var lastCodexTokenRefresh = Date.distantPast
@@ -588,6 +592,17 @@ final class AppModel: ObservableObject {
     (try? String(contentsOf: codexHistoryCacheURL(sessionID: sessionID), encoding: .utf8)) ?? ""
   }
 
+  private func activeHistoryCacheMatches(_ value: String, historyID: String) -> Bool {
+    let trimmedID = historyID.trimmed
+    guard !trimmedID.isEmpty else { return true }
+    return codexHistoryID(fromTranscript: value) == Optional(trimmedID)
+  }
+
+  private func validatedCodexHistoryTranscript(sessionID: UUID, historyID: String) -> String {
+    let cached = cachedCodexHistoryTranscript(sessionID: sessionID)
+    return activeHistoryCacheMatches(cached, historyID: historyID) ? cached : ""
+  }
+
   private func byteCount(_ value: String) -> Int {
     value.lengthOfBytes(using: .utf8)
   }
@@ -601,9 +616,20 @@ final class AppModel: ObservableObject {
       clearCodexDerivedState()
       return
     }
-    let cachedHistory = activeSessionID.map(cachedCodexHistoryTranscript(sessionID:)) ?? ""
+    let activeHistoryID = activeSession?.codexHistoryID.trimmed ?? ""
+    let rawCachedHistory =
+      activeSessionID.map {
+        validatedCodexHistoryTranscript(sessionID: $0, historyID: activeHistoryID)
+      } ?? ""
+    let rawCachedTranscript = cachedTranscript(for: .codex)
+    let cachedTranscriptMatchesActive =
+      activeHistoryCacheMatches(rawCachedTranscript, historyID: activeHistoryID)
+    let cachedHistory =
+      rawCachedHistory
     let cachedCodex =
-      cachedHistory.trimmed.isEmpty ? cachedTranscript(for: .codex) : cachedCodexDisplayWindow(cachedHistory)
+      cachedHistory.trimmed.isEmpty
+      ? (cachedTranscriptMatchesActive ? rawCachedTranscript : "")
+      : cachedCodexDisplayWindow(cachedHistory)
     if activeSession?.codexState == .fresh, activeSession?.codexHistoryID.trimmed.isEmpty != false,
       cachedCodex.trimmed.isEmpty
     {
@@ -671,14 +697,96 @@ final class AppModel: ObservableObject {
     let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     let newByteCount = byteCount(value)
     let existingByteCount = byteCount(existing)
-    if existingByteCount > 0, newByteCount + 512_000 < existingByteCount {
-      return existing
+    let incomingIsWindow = value.contains("transcript_window:")
+    let sameHistory =
+      codexHistoryID(fromTranscript: existing) == codexHistoryID(fromTranscript: value)
+        || codexHistoryID(fromTranscript: value) == nil
+    if existingByteCount > 0, incomingIsWindow, sameHistory, newByteCount + 512_000 < existingByteCount {
+      let next = mergedCodexHistoryCache(existing: existing, incoming: value) ?? value
+      if existingByteCount == byteCount(next),
+        transcriptFingerprint(existing) == transcriptFingerprint(next)
+      {
+        return existing
+      }
+      try? next.write(to: url, atomically: true, encoding: .utf8)
+      return next
     }
     if existingByteCount == newByteCount, transcriptFingerprint(existing) == transcriptFingerprint(value) {
       return existing
     }
     try? value.write(to: url, atomically: true, encoding: .utf8)
     return value
+  }
+
+  private func mergedCodexHistoryCache(existing: String, incoming: String) -> String? {
+    let existingClean = existing.trimmed
+    let incomingClean = incoming.trimmed
+    guard !existingClean.isEmpty, !incomingClean.isEmpty else { return nil }
+    let existingParts = codexRenderedHistoryParts(existingClean)
+    let incomingParts = codexRenderedHistoryParts(incomingClean)
+    let existingBody = existingParts.body
+    let incomingBody = incomingParts.body
+    guard !existingBody.isEmpty, !incomingBody.isEmpty else { return nil }
+    if existingBody.contains(incomingBody) { return existingClean }
+    if incomingBody.contains(existingBody) { return incomingClean }
+
+    let overlapLimit = min(existingBody.count, incomingBody.count, 768 * 1024)
+    guard overlapLimit >= 4096 else { return nil }
+    var overlap = overlapLimit
+    while overlap >= 4096 {
+      let existingSuffix = existingBody.suffix(overlap)
+      if incomingBody.hasPrefix(existingSuffix) {
+        let remaining = incomingBody.dropFirst(overlap)
+        let header =
+          (incomingParts.header.isEmpty ? existingParts.header : incomingParts.header)
+          .filter { !$0.lowercased().hasPrefix("transcript_window:") }
+        let body = ([existingBody, String(remaining)])
+          .map(\.trimmed)
+          .filter { !$0.isEmpty }
+          .joined(separator: "\n")
+        return (header + ["", body])
+          .filter { !$0.trimmed.isEmpty }
+          .joined(separator: "\n")
+      }
+      overlap -= 4096
+    }
+    return nil
+  }
+
+  private func codexRenderedHistoryParts(_ value: String) -> (header: [String], body: String) {
+    var header: [String] = []
+    var bodyLines: [String] = []
+    var scanningHeader = true
+    for line in value.components(separatedBy: .newlines) {
+      if scanningHeader {
+        let trimmed = line.trimmed
+        let lower = trimmed.lowercased()
+        if trimmed.isEmpty {
+          scanningHeader = false
+          continue
+        }
+        if lower.hasPrefix("codex history:") || lower.hasPrefix("latest_user:")
+          || lower.hasPrefix("directory:") || lower.hasPrefix("codex_history_id:")
+          || lower.hasPrefix("transcript_window:")
+        {
+          header.append(trimmed)
+          continue
+        }
+        scanningHeader = false
+      }
+      bodyLines.append(line)
+    }
+    return (header, bodyLines.joined(separator: "\n").trimmed)
+  }
+
+  private func codexHistoryID(fromTranscript value: String) -> String? {
+    for line in value.prefix(4096).components(separatedBy: .newlines) {
+      let trimmed = line.trimmed
+      guard trimmed.lowercased().hasPrefix("codex_history_id:") else { continue }
+      let id = String(trimmed.dropFirst("codex_history_id:".count)).trimmed
+      return id.isEmpty ? nil : id
+    }
+    return nil
   }
 
   private func persistBackgroundTranscript(_ kind: TranscriptKind, value: String, sessionID: UUID) {
@@ -764,7 +872,8 @@ final class AppModel: ObservableObject {
       item.sessionID == sessionID
         && (item.status == .queued || item.status == .sending || item.status == .waitingForCodex)
     }
-    guard hasUndeliveredLocalTurn else {
+    let deliveredBlocks = codexDeliveredQueueBlocksBySession[sessionID] ?? []
+    guard hasUndeliveredLocalTurn || !deliveredBlocks.isEmpty else {
       pendingCodexLocalTurnBlocksBySession.removeValue(forKey: sessionID)
       codexDeliveredQueueBlocksBySession.removeValue(forKey: sessionID)
       return incoming
@@ -782,7 +891,6 @@ final class AppModel: ObservableObject {
       pendingCodexLocalTurnBlocksBySession[sessionID] = Array(missingPendingBlocks.suffix(8))
     }
 
-    let deliveredBlocks = codexDeliveredQueueBlocksBySession[sessionID] ?? []
     let missingDeliveredBlocks = deliveredBlocks.filter { block in
       let norm = normalizedCodexTurnText(block)
       return !norm.isEmpty && !incomingNorm.contains(norm)
@@ -907,7 +1015,7 @@ final class AppModel: ObservableObject {
     }
     let historyID = session.codexHistoryID.trimmed
     guard !historyID.isEmpty, let sessionID = activeSessionID else { return }
-    let cached = cachedCodexHistoryTranscript(sessionID: sessionID)
+    let cached = validatedCodexHistoryTranscript(sessionID: sessionID, historyID: historyID)
     let cachedBytes = byteCount(cached)
     guard cachedBytes > 0 else { return }
     let displayBytes = codexHistoryDisplayBytes(for: historyID)
@@ -1232,13 +1340,38 @@ final class AppModel: ObservableObject {
 
   private func removeCodexQueueItem(_ id: UUID) {
     guard let index = codexPromptQueue.firstIndex(where: { $0.id == id }) else { return }
+    codexPromptQueue[index].attachments.forEach(removeAttachmentSnapshotIfOwned)
     codexPromptQueue.remove(at: index)
     scheduleCodexTranscriptAnalysis(force: true)
   }
 
   private func markCodexQueueItemDelivered(_ item: CodexPromptQueueItem) {
+    if item.kind == .steer || item.kind == .send {
+      appendCodexDeliveredTurnBlock(
+        codexQueueBlock(for: visibleQueueItem(item), includeStatus: false),
+        sessionID: item.sessionID
+      )
+    }
     removeCodexQueueItem(item.id)
     statusText = "Codex prompt handed to A · \(Date().shortStamp)"
+  }
+
+  private func appendCodexDeliveredTurnBlock(_ block: String, sessionID: UUID?) {
+    let cleanBlock = block.trimmed
+    guard !cleanBlock.isEmpty, let sessionID else { return }
+    var deliveredBlocks = codexDeliveredQueueBlocksBySession[sessionID] ?? []
+    let key = normalizedCodexTurnText(cleanBlock)
+    if !key.isEmpty,
+      !deliveredBlocks.contains(where: { normalizedCodexTurnText($0) == key })
+    {
+      deliveredBlocks.append(cleanBlock)
+      codexDeliveredQueueBlocksBySession[sessionID] = Array(deliveredBlocks.suffix(8))
+    }
+    guard sessionID == activeSessionID else { return }
+    if !key.isEmpty, normalizedCodexTurnText(codexTranscript).contains(key) {
+      return
+    }
+    appendCodexLocalActivity(title: cleanBlock)
   }
 
   private func monitorCodexQueueItemDelivery(_ id: UUID) {
@@ -1421,10 +1554,13 @@ final class AppModel: ObservableObject {
       && items[index].kind == .send
     {
       if items[index].status == .queued {
+        guard canPromoteCodexQueueItemToSteer(items[index]) else { continue }
         items[index].kind = .steer
         items[index].updatedAt = Date()
         changed = true
-      } else if items[index].status == .waitingForCodex {
+      } else if items[index].status == .waitingForCodex,
+        canPromoteCodexQueueItemToSteer(items[index])
+      {
         remoteIDs.append(items[index].id)
       }
     }
@@ -1438,12 +1574,33 @@ final class AppModel: ObservableObject {
     }
   }
 
+  func canPromoteCodexQueueItemToSteer(_ item: CodexPromptQueueItem) -> Bool {
+    guard item.kind == .send,
+      item.status == .queued || item.status == .waitingForCodex
+    else { return false }
+    guard let sessionID = item.sessionID else { return false }
+    if codexWorkingSessionIDs.contains(sessionID) {
+      return true
+    }
+    return codexPromptQueue.contains { other in
+      other.id != item.id
+        && other.sessionID == sessionID
+        && other.createdAt < item.createdAt
+        && other.status == .waitingForCodex
+        && other.lastError.localizedCaseInsensitiveContains("Processing on A")
+    }
+  }
+
   func promoteCodexQueueItemToSteer(_ id: UUID) {
     guard let index = codexPromptQueue.firstIndex(where: { $0.id == id && $0.kind == .send })
     else { return }
     var items = codexPromptQueue
     switch items[index].status {
     case .queued:
+      guard canPromoteCodexQueueItemToSteer(items[index]) else {
+        statusText = "Send starts idle sessions; steer is available after Codex is running · \(Date().shortStamp)"
+        return
+      }
       items[index].kind = .steer
       items[index].updatedAt = Date()
       codexPromptQueue = items
@@ -1649,6 +1806,10 @@ final class AppModel: ObservableObject {
       })
     else { return }
     var items = codexPromptQueue
+    if items[index].kind == .steer, !canRetrySteerQueueItemAsSteer(items[index]) {
+      items[index].kind = .send
+      items[index].displayText = items[index].displayText ?? items[index].visibleText
+    }
     items[index].status = .queued
     items[index].lastError = ""
     items[index].remoteQueueID = nil
@@ -1673,6 +1834,10 @@ final class AppModel: ObservableObject {
     where items[index].sessionID == activeSessionID
       && items[index].status == .failed
     {
+      if items[index].kind == .steer, !canRetrySteerQueueItemAsSteer(items[index]) {
+        items[index].kind = .send
+        items[index].displayText = items[index].displayText ?? items[index].visibleText
+      }
       items[index].status = .queued
       items[index].lastError = ""
       items[index].remoteQueueID = nil
@@ -1682,6 +1847,17 @@ final class AppModel: ObservableObject {
     if changed {
       codexPromptQueue = items
       processCodexPromptQueue()
+    }
+  }
+
+  private func canRetrySteerQueueItemAsSteer(_ item: CodexPromptQueueItem) -> Bool {
+    guard let sessionID = item.sessionID else { return false }
+    if codexWorkingSessionIDs.contains(sessionID) { return true }
+    return codexPromptQueue.contains { other in
+      other.id != item.id
+        && other.sessionID == sessionID
+        && other.status == .waitingForCodex
+        && other.lastError.localizedCaseInsensitiveContains("Processing on A")
     }
   }
 
@@ -1702,9 +1878,15 @@ final class AppModel: ObservableObject {
     await refreshCodexPromptQueueStatuses()
     if selectedSurface == .codex, let record = activeCodexHistoryRecord() {
       await loadCodexHistoryTranscript(record)
+      Task(priority: .utility) { [weak self] in
+        await self?.warmRecentCodexSessionCaches(force: true)
+      }
       return
     }
     await captureCodexIfUseful(force: true)
+    Task(priority: .utility) { [weak self] in
+      await self?.warmRecentCodexSessionCaches(force: true)
+    }
   }
 
   private func isCodexControlError(_ text: String) -> Bool {
@@ -2545,6 +2727,9 @@ final class AppModel: ObservableObject {
         || claudeWorkingSessionIDs.contains(first.id)
       let secondWorking = codexWorkingSessionIDs.contains(second.id)
         || claudeWorkingSessionIDs.contains(second.id)
+      if firstWorking != secondWorking {
+        return firstWorking
+      }
       if firstWorking && secondWorking {
         return (originalIndex[first.id] ?? Int.max) < (originalIndex[second.id] ?? Int.max)
       }
@@ -3139,7 +3324,12 @@ final class AppModel: ObservableObject {
   }
 
   private func warmRecentCodexSessionCaches(force: Bool = false) async {
-    guard !isWarmingRecentCodexSessions else { return }
+    guard !isWarmingRecentCodexSessions else {
+      if force {
+        pendingForcedRecentCodexSessionWarm = true
+      }
+      return
+    }
     let candidates = Array(
       sessions
         .filter { !$0.codexHistoryID.trimmed.isEmpty }
@@ -3152,13 +3342,22 @@ final class AppModel: ObservableObject {
           }
           return first.updatedAt > second.updatedAt
         }
-        .prefix(force ? 6 : 5)
+        .prefix(force ? 32 : 8)
     )
     guard !candidates.isEmpty else { return }
     isWarmingRecentCodexSessions = true
-    defer { isWarmingRecentCodexSessions = false }
+    pendingForcedRecentCodexSessionWarm = false
+    defer {
+      isWarmingRecentCodexSessions = false
+      if pendingForcedRecentCodexSessionWarm {
+        pendingForcedRecentCodexSessionWarm = false
+        Task(priority: .utility) { [weak self] in
+          await self?.warmRecentCodexSessionCaches(force: true)
+        }
+      }
+    }
 
-    let batchSize = 1
+    let batchSize = force ? 2 : 1
     var start = 0
     while start < candidates.count {
       guard !Task.isCancelled else { return }
@@ -4368,6 +4567,10 @@ final class AppModel: ObservableObject {
 
   @discardableResult
   func sendCodex(steer: Bool, displayText: String? = nil) async -> Bool {
+    guard !isSnapshottingCodexAttachments else {
+      statusText = "Wait for attachment snapshotting to finish · \(Date().shortStamp)"
+      return false
+    }
     let text = codexInput.trimmed
     guard !text.isEmpty || !codexAttachments.isEmpty else { return false }
     if !isValidCodexModelName(codexModel) {
@@ -4383,17 +4586,11 @@ final class AppModel: ObservableObject {
       return false
     }
     enableToolForActiveSession(.codex, touch: true)
-    let item = addCodexQueueItem(
+    _ = addCodexQueueItem(
       kind: shouldSteer ? .steer : .send,
       text: text,
       displayText: displayText
     )
-    if shouldSteer {
-      appendCodexLocalTurnBlock(
-        codexQueueBlock(for: visibleQueueItem(item), includeStatus: false),
-        preserveThroughCapture: true
-      )
-    }
     codexInput = ""
     codexAttachments.removeAll()
     statusText =
@@ -4412,6 +4609,10 @@ final class AppModel: ObservableObject {
     attachments: [PromptAttachment]? = nil,
     loopCount requestedLoopCount: Int = CodexResearchPreset.defaultLoopCount
   ) async -> Bool {
+    guard !isSnapshottingCodexAttachments else {
+      statusText = "Wait for attachment snapshotting to finish · \(Date().shortStamp)"
+      return false
+    }
     if codexPluginLog.trimmed.isEmpty {
       await checkCodexPlugins()
     }
@@ -4841,7 +5042,7 @@ final class AppModel: ObservableObject {
     let historyID = record.id.trimmed
     let result = await codexHistoryTranscriptResult(
       for: record,
-      tailBytes: max(codexHistoryDisplayBytes(for: historyID), Self.maxCodexTranscriptTailBytes)
+      tailBytes: codexHistoryDisplayBytes(for: historyID)
     )
     _ = applyCodexHistoryTranscriptResult(result, record: record, force: true)
   }
@@ -4859,7 +5060,7 @@ final class AppModel: ObservableObject {
     defer { isLoadingMoreCodexTranscript = false }
 
     if let sessionID = activeSessionID {
-      let cached = cachedCodexHistoryTranscript(sessionID: sessionID)
+      let cached = validatedCodexHistoryTranscript(sessionID: sessionID, historyID: historyID)
       let cachedBytes = byteCount(cached)
       if cachedBytes > currentBytes + 32_768 {
         let localNextBytes = min(nextBytes, cachedBytes, Self.maxCodexTranscriptTailBytes)
@@ -5010,9 +5211,6 @@ final class AppModel: ObservableObject {
       return true
     }
     if !transcript.contains("codex_history_id: \(historyID)") {
-      return true
-    }
-    if transcript.lengthOfBytes(using: .utf8) < 32 * 1024 {
       return true
     }
     guard record.mtime > 0 else {
@@ -7005,6 +7203,16 @@ final class AppModel: ObservableObject {
       totalBytes: max(0, totalBytes)
     )
     progress.updatedAt = Date()
+    activeFileTransfers.append(progress)
+    if activeFileTransfers.count > 8 {
+      let overflow = activeFileTransfers.count - 8
+      var removed = 0
+      activeFileTransfers.removeAll { progress in
+        guard removed < overflow, progress.isFinished else { return false }
+        removed += 1
+        return true
+      }
+    }
     activeFileTransfer = progress
     appendFileTransferLog("\(phase): \(source) -> \(destination)")
     return progress.id
@@ -7016,7 +7224,8 @@ final class AppModel: ObservableObject {
     completedBytes: Int64? = nil,
     totalBytes: Int64? = nil
   ) {
-    guard var progress = activeFileTransfer, progress.id == id else { return }
+    guard let index = activeFileTransfers.firstIndex(where: { $0.id == id }) else { return }
+    var progress = activeFileTransfers[index]
     if let phase {
       progress.phase = phase
     }
@@ -7027,6 +7236,7 @@ final class AppModel: ObservableObject {
       progress.totalBytes = max(0, totalBytes)
     }
     progress.updatedAt = Date()
+    activeFileTransfers[index] = progress
     activeFileTransfer = progress
   }
 
@@ -7035,10 +7245,11 @@ final class AppModel: ObservableObject {
     succeeded: Bool,
     message: String
   ) {
-    guard var progress = activeFileTransfer, progress.id == id else {
+    guard let index = activeFileTransfers.firstIndex(where: { $0.id == id }) else {
       appendFileTransferLog(message)
       return
     }
+    var progress = activeFileTransfers[index]
     if succeeded, progress.totalBytes > 0 {
       progress.completedBytes = progress.totalBytes
     }
@@ -7046,15 +7257,15 @@ final class AppModel: ObservableObject {
     progress.isFinished = true
     progress.succeeded = succeeded
     progress.updatedAt = Date()
+    activeFileTransfers[index] = progress
     activeFileTransfer = progress
     appendFileTransferLog(message)
     Task { [weak self] in
       try? await Task.sleep(nanoseconds: 5_000_000_000)
       await MainActor.run {
-        guard let self, self.activeFileTransfer?.id == id,
-          self.activeFileTransfer?.isFinished == true
-        else { return }
-        self.activeFileTransfer = nil
+        guard let self else { return }
+        self.activeFileTransfers.removeAll { $0.id == id && $0.isFinished }
+        self.activeFileTransfer = self.activeFileTransfers.last
       }
     }
   }
@@ -7661,25 +7872,86 @@ final class AppModel: ObservableObject {
   }
 
   func addCodexAttachments(_ urls: [URL]) {
-    let newItems =
-      urls
-      .filter { FileManager.default.fileExists(atPath: $0.path) }
-      .map { url in
-        makeAttachment(from: url)
-      }
-    guard !newItems.isEmpty else {
+    let existingURLs = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
+    guard !existingURLs.isEmpty else {
       statusText = "No local files found · \(Date().shortStamp)"
       return
     }
-    codexAttachments.append(contentsOf: newItems)
-    statusText = "\(codexAttachments.count) attachment(s) ready · \(Date().shortStamp)"
+    let generation = UUID()
+    codexAttachmentSnapshotGeneration = generation
+    isSnapshottingCodexAttachments = true
+    let transferID = beginTrackedFileTransfer(
+      title: "Snapshotting attachments",
+      source: existingURLs.count == 1 ? existingURLs[0].path : "\(existingURLs.count) local item(s)",
+      destination: attachmentDirectory.path,
+      totalBytes: Int64(existingURLs.count),
+      phase: "Snapshotting"
+    )
+    statusText = "Snapshotting attachment(s) · \(Date().shortStamp)"
+    let destinationDirectory = attachmentDirectory
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      var newItems: [PromptAttachment] = []
+      var failures: [String] = []
+      for (index, url) in existingURLs.enumerated() {
+        do {
+          let attachment = try Self.snapshotAttachment(from: url, in: destinationDirectory)
+          newItems.append(attachment)
+        } catch {
+          failures.append("\(url.path): \(error.localizedDescription)")
+        }
+        DispatchQueue.main.async { [weak self] in
+          self?.updateTrackedFileTransfer(
+            transferID,
+            phase: "Snapshotting \(index + 1)/\(existingURLs.count)",
+            completedBytes: Int64(index + 1),
+            totalBytes: Int64(existingURLs.count)
+          )
+        }
+      }
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        guard self.codexAttachmentSnapshotGeneration == generation else {
+          newItems.forEach(self.removeAttachmentSnapshotIfOwned)
+          self.finishTrackedFileTransfer(
+            transferID,
+            succeeded: false,
+            message: "Attachment snapshot canceled"
+          )
+          return
+        }
+        self.isSnapshottingCodexAttachments = false
+        if newItems.isEmpty {
+          self.finishTrackedFileTransfer(
+            transferID,
+            succeeded: false,
+            message: "Attachment snapshot failed: \(failures.joined(separator: "; "))"
+          )
+          self.statusText = "Attach failed · \(Date().shortStamp)"
+          self.lastMirrorLog = failures.joined(separator: "\n")
+          return
+        }
+        self.codexAttachments.append(contentsOf: newItems)
+        self.finishTrackedFileTransfer(
+          transferID,
+          succeeded: failures.isEmpty,
+          message:
+            failures.isEmpty
+            ? "Snapshotted \(newItems.count) attachment(s)"
+            : "Snapshotted \(newItems.count) attachment(s), \(failures.count) failed"
+        )
+        self.statusText = "\(self.codexAttachments.count) attachment(s) ready · \(Date().shortStamp)"
+        if !failures.isEmpty {
+          self.lastMirrorLog = failures.joined(separator: "\n")
+        }
+      }
+    }
   }
 
   func addCodexImageAttachment(data: Data, suggestedExtension: String = "png") {
     let stamp = DateFormatter.attachmentStamp.string(from: Date())
     let ext = suggestedExtension.sanitizedFileName.lowercased()
     let url = attachmentDirectory.appendingPathComponent(
-      "pasted-image-\(stamp).\(ext.isEmpty ? "png" : ext)")
+      "pasted-image-\(stamp)-\(UUID().uuidString.prefix(8)).\(ext.isEmpty ? "png" : ext)")
     do {
       try data.write(to: url, options: .atomic)
       codexAttachments.append(makeAttachment(from: url, kind: "image"))
@@ -7691,10 +7963,14 @@ final class AppModel: ObservableObject {
   }
 
   func removeCodexAttachment(_ attachment: PromptAttachment) {
+    removeAttachmentSnapshotIfOwned(attachment)
     codexAttachments.removeAll { $0.id == attachment.id }
   }
 
   func clearCodexAttachments() {
+    codexAttachmentSnapshotGeneration = UUID()
+    isSnapshottingCodexAttachments = false
+    codexAttachments.forEach(removeAttachmentSnapshotIfOwned)
     codexAttachments.removeAll()
   }
 
@@ -7973,7 +8249,23 @@ final class AppModel: ObservableObject {
       """
     lastMirrorLog =
       "Preparing archive on A: \(selectionDescription)\nDestination: \(saveBaseURL.path)\nMode: remote tar + single rsync transfer"
+    updateTrackedFileTransfer(transferID, phase: "Archiving on A")
+    let archiveHeartbeat = Task { [weak self] in
+      var seconds = 0
+      while !Task.isCancelled {
+        try? await Task.sleep(nanoseconds: 5_000_000_000)
+        guard !Task.isCancelled else { return }
+        seconds += 5
+        await MainActor.run {
+          self?.updateTrackedFileTransfer(
+            transferID,
+            phase: "Archiving on A · \(seconds)s"
+          )
+        }
+      }
+    }
     let create = await client.shell(createScript, timeout: 3600)
+    archiveHeartbeat.cancel()
     guard create.exitCode == 0 else {
       await deleteRemoteSaveTemporary(remoteArchive)
       finishTrackedFileTransfer(
@@ -8686,7 +8978,7 @@ final class AppModel: ObservableObject {
     var used = Set<String>()
     var names: [UUID: String] = [:]
     for attachment in attachments {
-      let baseName = attachment.name.sanitizedFileName
+      let baseName = attachment.uploadName.sanitizedFileName
       let uploadName = uniqueAttachmentUploadName(baseName, used: &used)
       names[attachment.id] = uploadName
     }
@@ -8711,7 +9003,34 @@ final class AppModel: ObservableObject {
     return candidate
   }
 
+  nonisolated private static func snapshotAttachment(from url: URL, in attachmentDirectory: URL) throws
+    -> PromptAttachment
+  {
+    let stamp = DateFormatter.attachmentStamp.string(from: Date())
+    let safeName = url.lastPathComponent.sanitizedFileName.trimmed.isEmpty
+      ? "attachment" : url.lastPathComponent.sanitizedFileName
+    let snapshotURL = attachmentDirectory.appendingPathComponent(
+      "snapshot-\(stamp)-\(UUID().uuidString.prefix(8))-\(safeName)")
+    try FileManager.default.copyItem(at: url, to: snapshotURL)
+    var attachment = makeAttachmentValue(from: snapshotURL)
+    attachment.name = url.lastPathComponent
+    return attachment
+  }
+
+  private func removeAttachmentSnapshotIfOwned(_ attachment: PromptAttachment) {
+    let snapshotPath = attachment.localURL.standardizedFileURL.path
+    let attachmentRoot = attachmentDirectory.standardizedFileURL.path + "/"
+    guard snapshotPath.hasPrefix(attachmentRoot) else { return }
+    try? FileManager.default.removeItem(at: attachment.localURL)
+  }
+
   private func makeAttachment(from url: URL, kind explicitKind: String? = nil) -> PromptAttachment {
+    Self.makeAttachmentValue(from: url, kind: explicitKind)
+  }
+
+  nonisolated private static func makeAttachmentValue(from url: URL, kind explicitKind: String? = nil)
+    -> PromptAttachment
+  {
     let resourceValues = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
     let isDirectory = resourceValues?.isDirectory == true
     let size = Int64(resourceValues?.fileSize ?? 0)

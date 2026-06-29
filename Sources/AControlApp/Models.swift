@@ -704,6 +704,11 @@ struct FileTransferProgress: Identifiable, Equatable {
     if totalBytes > 0 {
       return "\(ByteCountFormatter.string(fromByteCount: completedBytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file))"
     }
+    if isFinished {
+      return completedBytes > 0
+        ? ByteCountFormatter.string(fromByteCount: completedBytes, countStyle: .file)
+        : "0 bytes"
+    }
     if completedBytes > 0 {
       return ByteCountFormatter.string(fromByteCount: completedBytes, countStyle: .file)
     }
@@ -727,7 +732,8 @@ struct PromptAttachment: Identifiable, Hashable, Codable {
   var createdAt = Date()
 
   var displaySize: String {
-    guard size > 0 else { return "folder" }
+    if kind == "folder" { return "folder" }
+    guard size > 0 else { return "0 bytes" }
     return ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
   }
 
@@ -1006,11 +1012,16 @@ struct SessionCard: Identifiable, Codable, Hashable {
   }
 
   var displayTitle: String {
+    let sessionName = name.trimmed
+    if nameSource == .user, !sessionName.isEmpty,
+      !Self.isSyntheticCodexFallbackTitle(sessionName)
+    {
+      return sessionName
+    }
     let codexTitle = codexHistoryTitle.trimmed
     if !codexTitle.isEmpty, !Self.isSyntheticCodexFallbackTitle(codexTitle) {
       return codexTitle
     }
-    let sessionName = name.trimmed
     if !sessionName.isEmpty, !Self.isSyntheticCodexFallbackTitle(sessionName) {
       return sessionName
     }

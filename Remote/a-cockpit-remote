@@ -6177,11 +6177,32 @@ except Exception:
     max_tail_bytes = 4194304
 max_tail_bytes = max(1048576, min(max_tail_bytes, 67108864))
 
+def path_matches_session(path):
+    if not session_id:
+        return True
+    try:
+        with pathlib.Path(path).expanduser().open(errors="replace") as handle:
+            saw_meta = False
+            for index, line in enumerate(handle):
+                if index > 500:
+                    break
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") == "session_meta":
+                    saw_meta = True
+                    meta = obj.get("payload") or {}
+                    return meta.get("id") == session_id
+            return (not saw_meta) and session_id in str(path)
+    except Exception:
+        return False
+
 def candidate_paths():
     seen = set()
     if path_hint:
         p = pathlib.Path(path_hint).expanduser()
-        if p.exists() and p.is_file():
+        if p.exists() and p.is_file() and path_matches_session(p):
             seen.add(str(p))
             yield p
     state_db = pathlib.Path.home() / ".codex" / "state_5.sqlite"
@@ -6193,7 +6214,7 @@ def candidate_paths():
                 ):
                     if rollout_path:
                         p = pathlib.Path(rollout_path).expanduser()
-                        if p.exists() and str(p) not in seen:
+                        if p.exists() and str(p) not in seen and path_matches_session(p):
                             seen.add(str(p))
                             yield p
         except Exception:
@@ -6202,7 +6223,7 @@ def candidate_paths():
     if session_id and base.exists():
         for p in base.glob("**/*.jsonl"):
             if session_id in p.name or session_id in str(p):
-                if str(p) not in seen:
+                if str(p) not in seen and path_matches_session(p):
                     seen.add(str(p))
                     yield p
         for p in base.glob("**/*.jsonl"):

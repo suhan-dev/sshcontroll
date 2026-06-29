@@ -166,6 +166,9 @@ struct RootView: View {
       search.isEmpty
       ? model.sessions
       : model.sessions.filter { sidebarSession($0, matches: search) }
+    let projectSessions = searchableSessions.filter { !$0.isPinned }
+    let modelOrderIndex = Dictionary(
+      uniqueKeysWithValues: model.sessions.enumerated().map { ($0.element.id, $0.offset) })
     let sortSessions: ([SessionCard]) -> [SessionCard] = { sessions in
       sessions.sorted { first, second in
         let firstWorking =
@@ -175,10 +178,13 @@ struct RootView: View {
           model.codexWorkingSessionIDs.contains(second.id)
           || model.claudeWorkingSessionIDs.contains(second.id)
         if firstWorking != secondWorking { return firstWorking }
+        if firstWorking && secondWorking {
+          return (modelOrderIndex[first.id] ?? Int.max) < (modelOrderIndex[second.id] ?? Int.max)
+        }
         return first.updatedAt > second.updatedAt
       }
     }
-    let grouped = Dictionary(grouping: searchableSessions) { session in
+    let grouped = Dictionary(grouping: projectSessions) { session in
       sidebarProjectID(for: session.remoteDir)
     }
     let groups = grouped.map { id, sessions in
@@ -247,16 +253,28 @@ struct RootView: View {
 
   private func sidebarProjectSection(_ group: SidebarProjectGroup) -> some View {
     let isSearching = !sidebarSearchText.trimmed.isEmpty
-    let isExpanded = group.isPinnedGroup || isSearching || expandedSidebarProjectIDs.contains(group.id)
+    let activeID = model.activeSessionID
+    let containsActiveSession = group.sessions.contains { $0.id == activeID }
+    let isExpanded =
+      group.isPinnedGroup || isSearching || containsActiveSession
+      || expandedSidebarProjectIDs.contains(group.id)
     let visibleLimit =
       isSearching
       ? group.sessions.count
       : min(group.sessions.count, sidebarProjectVisibleLimits[group.id] ?? sidebarProjectSessionPageSize)
-    let visibleSessions =
-      isExpanded
-      ? Array(group.sessions.prefix(visibleLimit))
-      : []
-    let remainingSessionCount = max(0, group.sessions.count - visibleLimit)
+    let visibleSessions: [SessionCard] = {
+      guard isExpanded else { return [] }
+      var sessions = Array(group.sessions.prefix(visibleLimit))
+      if let activeID, let active = group.sessions.first(where: { $0.id == activeID }),
+        !sessions.contains(where: { $0.id == activeID })
+      {
+        sessions.append(active)
+      }
+      return sessions
+    }()
+    let visibleSessionIDs = Set(visibleSessions.map(\.id))
+    let remainingSessionCount =
+      group.sessions.filter { !visibleSessionIDs.contains($0.id) }.count
     return VStack(alignment: .leading, spacing: 4) {
       SidebarProjectHeaderRow(
         title: group.title,
@@ -342,21 +360,41 @@ struct RootView: View {
   }
 
   private func normalizedSidebarProjectPath(_ rawPath: String) -> String {
+    let remoteHome = normalizedSidebarPathComponent(model.settings.remoteHome)
     var value = rawPath.trimmed
     guard !value.isEmpty else { return "" }
+    if value == "~" {
+      value = remoteHome.isEmpty ? value : remoteHome
+    } else if value.hasPrefix("~/"), !remoteHome.isEmpty {
+      value = remoteHome + "/" + String(value.dropFirst(2))
+    }
+    value = normalizedSidebarPathComponent(value)
+    if value == "." || value == "~" || value == remoteHome {
+      return remoteHome.isEmpty ? value : remoteHome
+    }
+    return value
+  }
+
+  private func normalizedSidebarPathComponent(_ rawPath: String) -> String {
+    var value = rawPath.trimmed.decomposedStringWithCanonicalMapping
+    guard !value.isEmpty else { return "" }
+    while value.contains("//") {
+      value = value.replacingOccurrences(of: "//", with: "/")
+    }
+    if value != "~", !value.hasPrefix("~/") {
+      value = (value as NSString).standardizingPath.decomposedStringWithCanonicalMapping
+    }
     while value.count > 1, value.hasSuffix("/") {
       value.removeLast()
-    }
-    if value == "." || value == "~" || value == model.settings.remoteHome.trimmed {
-      return value
     }
     return value
   }
 
   private func sidebarProjectTitle(for rawPath: String) -> String {
     let path = normalizedSidebarProjectPath(rawPath)
+    let remoteHome = normalizedSidebarPathComponent(model.settings.remoteHome)
     guard !path.isEmpty else { return "No Folder" }
-    if path == "~" || path == model.settings.remoteHome.trimmed {
+    if path == "~" || (!remoteHome.isEmpty && path == remoteHome) {
       return "Home"
     }
     return path.split(separator: "/").last.map(String.init) ?? path
@@ -378,7 +416,7 @@ struct RootView: View {
   private func shortSidebarPath(_ rawPath: String) -> String {
     let path = normalizedSidebarProjectPath(rawPath)
     guard !path.isEmpty else { return "" }
-    let remoteHome = model.settings.remoteHome.trimmed
+    let remoteHome = normalizedSidebarPathComponent(model.settings.remoteHome)
     guard !remoteHome.isEmpty else { return path }
     if path == remoteHome { return "~" }
     if path.hasPrefix(remoteHome + "/") {

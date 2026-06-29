@@ -239,7 +239,7 @@ struct CodeWorkspaceView: View {
 
       Spacer()
 
-      if !workspaceQueueItems.isEmpty {
+      if !workspaceQueueItems.isEmpty && model.isCodeWorkspaceCodexCollapsed {
         Label("\(workspaceQueueItems.count)", systemImage: "tray.full")
           .font(.caption.weight(.bold))
           .foregroundStyle(Color.orange.opacity(0.92))
@@ -891,9 +891,7 @@ private struct CodeWorkspaceQueueStrip: View {
         Label("\(items.count) queued", systemImage: "tray.full")
           .font(.system(size: 11.5, weight: .bold))
         Spacer()
-        if items.contains(where: {
-          $0.kind == .send && ($0.status == .queued || $0.status == .waitingForCodex)
-        })
+        if items.contains(where: { model.canPromoteCodexQueueItemToSteer($0) })
         {
           Button {
             model.promoteQueuedCodexItemsToSteer()
@@ -979,14 +977,9 @@ private struct CodeWorkspaceQueueRow: View {
           .lineLimit(1)
       }
       Spacer(minLength: 8)
-      if item.kind == .send && (item.status == .queued || item.status == .waitingForCodex) {
+      if model.canPromoteCodexQueueItemToSteer(item) {
         queueButton("arrow.triangle.turn.up.right.diamond", help: "Convert to steer") {
           model.promoteCodexQueueItemToSteer(item.id)
-        }
-      }
-      if item.kind == .steer && (item.status == .queued || item.status == .waitingForCodex) {
-        queueButton("paperplane", help: "Convert to Send") {
-          model.demoteCodexQueueItemToSend(item.id)
         }
       }
       if item.status == .failed {

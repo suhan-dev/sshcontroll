@@ -1055,10 +1055,10 @@ private struct CodexPromptPanel: View {
 
             Spacer(minLength: 8)
 
-            if model.isProcessingCodexPromptQueue {
+            if model.isProcessingCodexPromptQueue || model.isSnapshottingCodexAttachments {
               ProgressView()
                 .controlSize(.small)
-                .safeHelp("Sending queued prompt")
+                .safeHelp(model.isSnapshottingCodexAttachments ? "Snapshotting attachments" : "Sending queued prompt")
             }
 
             CodexPromptControls(
@@ -1074,19 +1074,7 @@ private struct CodexPromptPanel: View {
             .frame(minWidth: 0, maxWidth: 1040, alignment: .trailing)
             .layoutPriority(3)
 
-            CodexGoalRuntimeControls(
-              markGoal: { markDraftAsGoal() },
-              refreshStatus: { Task { await model.codexSlash("/status") } },
-              pause: { Task { await model.codexKey("esc") } },
-              resume: { Task { await model.codexKey("enter") } }
-            )
-
-            AgentChoiceControls(
-              onUp: { Task { await model.codexKey("up") } },
-              onDown: { Task { await model.codexKey("down") } },
-              onEnter: { Task { await model.codexKey("enter") } },
-              onEscape: { Task { await model.codexKey("esc") } }
-            )
+            runtimeOverflowMenu
 
             steerSubmitButton
 
@@ -1098,6 +1086,7 @@ private struct CodexPromptPanel: View {
             ) {
               submit(steer: false)
             }
+            .disabled(model.isSnapshottingCodexAttachments)
           }
           .padding(.horizontal, 14)
           .padding(.vertical, 10)
@@ -1180,6 +1169,44 @@ private struct CodexPromptPanel: View {
     draft = "Pursue this goal:\n\(clean)"
   }
 
+  private var runtimeOverflowMenu: some View {
+    Menu {
+      Button("Mark Draft as Goal") {
+        markDraftAsGoal()
+      }
+      Button("Refresh Codex Status") {
+        Task { await model.codexSlash("/status") }
+      }
+      Divider()
+      Button("Pause / Escape") {
+        Task { await model.codexKey("esc") }
+      }
+      Button("Resume / Enter") {
+        Task { await model.codexKey("enter") }
+      }
+      Divider()
+      Button("Choice Up") {
+        Task { await model.codexKey("up") }
+      }
+      Button("Choice Down") {
+        Task { await model.codexKey("down") }
+      }
+    } label: {
+      Image(systemName: "ellipsis.circle")
+        .font(.system(size: 15, weight: .semibold))
+        .frame(width: 34, height: 34)
+        .contentShape(Circle())
+    }
+    .menuStyle(.button)
+    .buttonStyle(ImmediateFeedbackButtonStyle())
+    .foregroundStyle(.secondary)
+    .background(AControlStyle.insetFill(colorScheme), in: Circle())
+    .overlay {
+      Circle().strokeBorder(AControlStyle.hairline(colorScheme), lineWidth: 1)
+    }
+    .safeHelp("Goal, status, pause/resume, and choice controls")
+  }
+
   private var steerSubmitButton: some View {
     Button {
       submit(steer: true)
@@ -1191,7 +1218,7 @@ private struct CodexPromptPanel: View {
         .frame(height: 34)
     }
     .buttonStyle(ImmediateFeedbackButtonStyle())
-    .disabled(!canSteerCodex)
+    .disabled(!canSteerCodex || model.isSnapshottingCodexAttachments)
     .foregroundStyle(
       canSteerCodex
         ? AControlStyle.accentForeground(.blue, colorScheme)
@@ -1596,7 +1623,7 @@ private struct CodexQueueChip: View {
       Spacer(minLength: 8)
 
       HStack(spacing: 5) {
-        if item.kind == .send && (item.status == .queued || item.status == .waitingForCodex) {
+        if model.canPromoteCodexQueueItemToSteer(item) {
           queueTextButton(
             "Steer",
             symbol: "arrow.triangle.turn.up.right.diamond",
@@ -2759,6 +2786,18 @@ struct CodexTranscriptCard: View {
 
         TranscriptScrollWheelSniffer {
           guard text.trimmed.count > 600 else { return }
+          if transcriptScrollMode == .pinBottom {
+            transcriptTailLocked = true
+            observedUserScrollSinceLastBottom = false
+            userHasScrolledAway = false
+            wheelScrollButtonFallback = false
+            if !transcriptAtBottom || transcriptDistanceToBottom > 8 {
+              DispatchQueue.main.async {
+                scrollSignal += 1
+              }
+            }
+            return
+          }
           observedUserScrollSinceLastBottom = true
           transcriptTailLocked = false
           scrollButtonSuppressed = false
@@ -2842,7 +2881,6 @@ struct CodexTranscriptCard: View {
         userHasScrolledAway = false
         wheelScrollButtonFallback = false
         sessionScrollSignal += 1
-        scrollSignal += 1
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -2859,6 +2897,8 @@ struct CodexTranscriptCard: View {
         sessionResetSignal: sessionScrollSignal,
         followTailSignal: followTailSignal,
         userIsReadingHistory: userHasScrolledAway,
+        autoScrollsToBottom: transcriptScrollMode != .manual,
+        pinBottom: transcriptScrollMode == .pinBottom,
         canLoadMore: canLoadMoreTranscript,
         isLoadingMore: isLoadingMoreTranscript,
         loadMore: {
@@ -2883,8 +2923,12 @@ struct CodexTranscriptCard: View {
             wheelScrollButtonFallback = false
             scrollButtonSuppressed = false
           } else if transcriptScrollMode == .pinBottom {
+            transcriptTailLocked = true
             userHasScrolledAway = false
             wheelScrollButtonFallback = false
+            DispatchQueue.main.async {
+              scrollSignal += 1
+            }
           } else if observedUserScrollSinceLastBottom || !transcriptTailLocked {
             transcriptTailLocked = false
             userHasScrolledAway = true
@@ -2912,8 +2956,12 @@ struct CodexTranscriptCard: View {
             wheelScrollButtonFallback = false
             scrollButtonSuppressed = false
           } else if transcriptScrollMode == .pinBottom {
+            transcriptTailLocked = true
             userHasScrolledAway = false
             wheelScrollButtonFallback = false
+            DispatchQueue.main.async {
+              scrollSignal += 1
+            }
           } else if observedUserScrollSinceLastBottom || !transcriptTailLocked {
             transcriptTailLocked = false
             userHasScrolledAway = true
@@ -3149,6 +3197,8 @@ struct CodexActivityTranscriptView: View {
   var sessionResetSignal: Int = 0
   var followTailSignal: Int
   var userIsReadingHistory = false
+  var autoScrollsToBottom = true
+  var pinBottom = false
   var canLoadMore = false
   var isLoadingMore = false
   var loadMore: () -> Void = {}
@@ -3161,6 +3211,7 @@ struct CodexActivityTranscriptView: View {
   @State private var lastAutoScrollAt = Date.distantPast
   @State private var pendingSessionResetScrollSignal: Int?
   @State private var pendingPreservedBottomDistance: CGFloat?
+  @State private var preserveRequestParseKey: String?
   @State private var restoreBottomDistanceSignal = 0
   @State private var restoreBottomDistance: CGFloat?
   @State private var parsedItems: [CodexActivityItem] = []
@@ -3296,12 +3347,30 @@ struct CodexActivityTranscriptView: View {
         resetForSessionChange(newValue, proxy: proxy)
       }
       .onChange(of: followTailSignal) { _, _ in
-        scheduleScrollToBottom(proxy, force: !userIsReadingHistory, delay: 70_000_000)
+        guard autoScrollsToBottom else { return }
+        scheduleScrollToBottom(proxy, force: pinBottom || !userIsReadingHistory, delay: 70_000_000)
+      }
+      .onChange(of: autoScrollsToBottom) { _, newValue in
+        if !newValue {
+          pendingAutoScrollTask?.cancel()
+          pendingSessionResetScrollSignal = nil
+          pendingPreservedBottomDistance = nil
+          preserveRequestParseKey = nil
+        }
+      }
+      .onChange(of: isLoadingMore) { oldValue, newValue in
+        guard oldValue, !newValue else { return }
+        if pendingPreservedBottomDistance != nil, preserveRequestParseKey == parseKey {
+          pendingPreservedBottomDistance = nil
+          preserveRequestParseKey = nil
+        }
       }
       .onChange(of: preserveBottomDistanceSignal) { _, _ in
         pendingPreservedBottomDistance = preserveBottomDistance
+        preserveRequestParseKey = parseKey
       }
       .onAppear {
+        guard autoScrollsToBottom else { return }
         scheduleScrollToBottom(proxy, force: true, delay: 90_000_000)
       }
       .task(id: parseKey) {
@@ -3316,28 +3385,32 @@ struct CodexActivityTranscriptView: View {
         let nextItems = parsed.enumerated().map { index, item in
           item.withStableID(index: index)
         }
-        let shouldKeepPinned = !userIsReadingHistory
-        let shouldForceForSession = pendingSessionResetScrollSignal == sessionResetSignal
+        let shouldKeepPinned = pinBottom || (autoScrollsToBottom && !userIsReadingHistory)
+        let shouldForceForSession = autoScrollsToBottom && pendingSessionResetScrollSignal == sessionResetSignal
         parsedItems = nextItems
         if let distance = pendingPreservedBottomDistance, !shouldForceForSession {
           pendingPreservedBottomDistance = nil
+          preserveRequestParseKey = nil
           restoreBottomDistance = distance
           restoreBottomDistanceSignal += 1
         } else if shouldForceForSession {
+          pendingPreservedBottomDistance = nil
+          preserveRequestParseKey = nil
           isAtBottom = true
           scheduleScrollToBottom(proxy, force: true, notify: true, delay: 30_000_000)
           if hasTranscriptText {
             pendingSessionResetScrollSignal = nil
           }
         } else if shouldKeepPinned {
-          scheduleScrollToBottom(proxy, force: false, delay: 50_000_000)
+          preserveRequestParseKey = nil
+          scheduleScrollToBottom(proxy, force: true, delay: 50_000_000)
         }
       }
     }
   }
 
   private var canFollowTail: Bool {
-    !userIsReadingHistory && isAtBottom
+    pinBottom || (autoScrollsToBottom && !userIsReadingHistory && isAtBottom)
   }
 
   private func scheduleScrollToBottom(
@@ -3357,7 +3430,18 @@ struct CodexActivityTranscriptView: View {
   }
 
   private func resetForSessionChange(_ signal: Int, proxy: ScrollViewProxy) {
+    guard autoScrollsToBottom else {
+      pendingSessionResetScrollSignal = nil
+      pendingPreservedBottomDistance = nil
+      preserveRequestParseKey = nil
+      expandedTextIDs.removeAll()
+      pendingAutoScrollTask?.cancel()
+      lastAutoScrollAt = .distantPast
+      return
+    }
     pendingSessionResetScrollSignal = signal
+    pendingPreservedBottomDistance = nil
+    preserveRequestParseKey = nil
     expandedTextIDs.removeAll()
     isAtBottom = true
     lastAutoScrollAt = .distantPast
