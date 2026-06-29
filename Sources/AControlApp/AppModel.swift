@@ -4246,6 +4246,9 @@ final class AppModel: ObservableObject {
   }
 
   private func shouldHideCodexHistoryRecordFromTopLevel(_ record: CodexHistoryRecord) -> Bool {
+    if record.isSpawnChild {
+      return true
+    }
     let title = titleForCodexRecord(record)
     let lower = title.lowercased()
     if lower.contains("subagent") || lower.contains("sub-agent") || lower.contains("sub agent")
@@ -4258,30 +4261,7 @@ final class AppModel: ObservableObject {
     {
       return true
     }
-    if record.isSpawnChild {
-      return !shouldShowSpawnChildCodexHistoryRecord(record, title: title)
-    }
     return false
-  }
-
-  private func shouldShowSpawnChildCodexHistoryRecord(
-    _ record: CodexHistoryRecord,
-    title: String
-  ) -> Bool {
-    let cleanTitle = cleanCodexHistoryTitle(title)?.trimmed ?? ""
-    guard cleanTitle.count >= 6 else { return false }
-    let cwd = normalizedRemotePath(record.cwd).lowercased()
-    let lower = cleanTitle.lowercased()
-    if cwd.contains("/desktop/dft"),
-      lower.range(of: #"^a\d+(?:\b|[-/ ])"#, options: .regularExpression) != nil
-    {
-      return true
-    }
-    return lower.hasPrefix("a0 ")
-      || lower.hasPrefix("a0-")
-      || lower.hasPrefix("a0/")
-      || lower.contains("central coordinator")
-      || lower.contains("central controller")
   }
 
   func importCodexHistorySessionsForCurrentDirectory() async {
